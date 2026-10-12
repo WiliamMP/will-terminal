@@ -6,7 +6,7 @@ O dono vem do **Delphi** e está aprendendo Rust e React: ao explicar código no
 
 ## Arquitetura
 
-- `src-tauri/src/pty.rs`: shells reais em ConPTY (portable-pty), copiado do will-repo. Saída vai por eventos `pty-output` / `pty-exit`.
+- `src-tauri/src/pty.rs`: shells reais em ConPTY (portable-pty), copiado do will-repo. Saída vai por eventos `pty-output` / `pty-exit`. Integração com o shell: o prompt de cada um emite OSC 133;D;<código> (fim do comando) e OSC 9;9;<pasta>; testes com shells reais.
 - `src-tauri/src/lib.rs`: registro dos comandos (**comando novo precisa entrar aqui**), ícone na bandeja e single-instance. Fechar a janela só a esconde (detach); os shells continuam no mesmo processo. "Sair" na bandeja emite `quit-requested`, a janela salva o layout e chama `exit_app`.
 - `src/panes.ts`: árvore de painéis de uma aba (funções puras: `split`, `remove`, `leaves`, `neighbor`). Testes em `panes.test.ts`.
 - `src/session.ts`: sessões xterm.js vivem num `Map` fora do React. Dividir um painel remonta o componente; se ele fosse dono do shell, o shell morreria. O componente `Leaf` só pega emprestado o `el`.

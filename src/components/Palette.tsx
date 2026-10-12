@@ -4,17 +4,18 @@ import { CornerDownLeft, Search } from "lucide-react";
 import { Dialog } from "radix-ui";
 import { matches, type Command } from "../commands";
 
-type Props = { open: boolean; onOpenChange: (open: boolean) => void; commands: Command[] };
+// initialQuery: opens already filtered (prefix + f shows the projects, prefix + = the copies)
+type Props = { open: boolean; onOpenChange: (open: boolean) => void; commands: Command[]; initialQuery?: string };
 
 // Command palette: type a few letters of any action and press Enter (port of will-repo's, without motion)
-export function Palette({ open, onOpenChange, commands }: Props) {
+export function Palette({ open, onOpenChange, commands, initialQuery = "" }: Props) {
   const [query, setQuery] = useState("");
   const [index, setIndex] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (open) {
-      setQuery("");
+      setQuery(initialQuery);
       setIndex(0);
     }
   }, [open]);

@@ -1,13 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
-import { homeDir } from "@tauri-apps/api/path";
+import { homeDir, join } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { cn } from "cn";
 import {
   ArrowLeftRight,
+  Check,
   ChevronDown,
+  CircleX,
+  ClipboardPaste,
+  FolderGit2,
+  LayoutGrid,
+  Loader2,
   Download,
   EyeOff,
   LayoutTemplate,
@@ -36,29 +43,37 @@ import { Toaster, toast } from "sonner";
 import type { Command } from "./commands";
 import { Palette } from "./components/Palette";
 import { SearchBar } from "./components/SearchBar";
-import { PREFIXES, Settings, type CloseAction, type PrefixKey, type Profile, type Theme } from "./components/Settings";
+import { LAYOUTS, PREFIXES, Settings, type CloseAction, type PrefixKey, type Theme } from "./components/Settings";
 import { IconButton } from "./components/ui";
 import { dragWindow, WindowControls } from "./components/WindowControls";
-import { isPane, layoutTree, leaves, neighbor, newId, remove, split, swap, type Dir, type Pane } from "./panes";
+import { isPane, layoutTree, leaves, neighbor, newId, remove, split, swap, type Dir, type Layout, type Pane } from "./panes";
+import { parseEnv, type Profile } from "./profiles";
 import {
   applyTheme,
+  buffers,
   copySelection,
   focusSession,
   getSession,
   handlers,
   killSession,
+  pasteInto,
   session,
   sessionCwd,
   SHELLS,
   writePane,
   zoomFont,
   type ShellKind,
+  type Start,
 } from "./session";
 import { checkForUpdate } from "./updater";
 
 // A tab is a tmux "window": a tree of panes, the one with the cursor, whether it is zoomed,
-// whether typing goes to all its panes (synchronize-panes), and a name given by the user
-type Tab = { id: number; root: Pane; focus: number; zoom: boolean; sync: boolean; name?: string };
+// whether typing goes to all its panes (synchronize-panes), a name given by the user and the last arrangement picked
+type Tab = { id: number; root: Pane; focus: number; zoom: boolean; sync: boolean; name?: string; layout?: Layout };
+
+// What the shell integration (OSC 133, see pty.rs) says about a pane's last command.
+// "done" = ended, but the shell can't tell the exit code (cmd).
+type PaneStatus = { state: "running" | "ok" | "error" | "done"; code?: number | null; since: number };
 
 const SHELL_KEY = "will-terminal.shell";
 const PREFIX_KEY = "will-terminal.prefix";
@@ -67,6 +82,10 @@ const LAYOUT_KEY = "will-terminal.layout";
 const CLOSE_KEY = "will-terminal.closeAction";
 const PROFILES_KEY = "will-terminal.profiles";
 const DETACHED_KEY = "will-terminal.detachedOnce";
+const PROJECTS_KEY = "will-terminal.projectsRoot";
+const LAYOUT_ORDER: Layout[] = ["row", "col", "main"];
+// a command shorter than this never notifies: you were looking at it
+const NOTIFY_AFTER_MS = 10_000;
 const ARROWS: Record<string, Dir> = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
 const FONT_KEYS: Record<string, number> = { "=": 1, "+": 1, "-": -1, "0": 0 };
 
@@ -83,7 +102,11 @@ const BINDINGS: [string, string][] = [
   ["1-9", "Ir para a aba"],
   [",", "Renomear aba"],
   ["&", "Fechar aba"],
+  ["Espaço", "Alternar arranjo dos painéis"],
   ["[", "Modo cópia (q sai)"],
+  ["]", "Colar a última cópia"],
+  ["=", "Colar do histórico de cópias"],
+  ["f", "Abrir projeto"],
   ["d", "Desanexar: esconde na bandeja, os terminais continuam"],
   [":", "Paleta de comandos"],
   ["?", "Esta ajuda"],
@@ -104,7 +127,13 @@ function newTab(): Tab {
   return { id: newId(), root: { kind: "leaf", id: pane }, focus: pane, zoom: false, sync: false };
 }
 
-type Saved = { tabs: Tab[]; active: number; cwds: Record<number, string>; shells?: Record<number, ShellKind> };
+type Saved = {
+  tabs: Tab[];
+  active: number;
+  cwds: Record<number, string>;
+  shells?: Record<number, ShellKind>;
+  envs?: Record<number, [string, string][]>;
+};
 
 /** Layout of the last session, or null if there is none (or it is damaged) */
 function loadLayout(): Saved | null {
@@ -114,6 +143,17 @@ function loadLayout(): Saved | null {
     if (v && Array.isArray(v.tabs) && v.tabs.length > 0 && v.tabs.every(ok)) return v;
   } catch {}
   return null;
+}
+
+const duration = (ms: number) => {
+  const sec = Math.round(ms / 1000);
+  return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}min ${sec % 60}s`;
+};
+
+async function notify(title: string, body: string) {
+  let granted = await isPermissionGranted();
+  if (!granted) granted = (await requestPermission()) === "granted";
+  if (granted) sendNotification({ title, body });
 }
 
 function loadProfiles(): Profile[] {
@@ -146,12 +186,12 @@ function copyModeKey(pane: number, e: KeyboardEvent): "stay" | "exit" | "search"
 }
 
 /** One shell: borrows the session's element, so moving the pane in the tree keeps the shell alive */
-function Leaf(props: { id: number; focused: boolean; synced: boolean; cwd: string; shell: ShellKind; command?: string; onFocus: () => void }) {
-  const { id, focused, synced, cwd, shell, command, onFocus } = props;
+function Leaf(props: { id: number; focused: boolean; synced: boolean; start: Start; onFocus: () => void }) {
+  const { id, focused, synced, start, onFocus } = props;
   const slot = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const s = getSession(id, cwd, shell, command);
+    const s = getSession(id, start);
     slot.current!.appendChild(s.el);
     const observer = new ResizeObserver(() => s.fit.fit());
     observer.observe(slot.current!);
@@ -179,6 +219,37 @@ function Leaf(props: { id: number; focused: boolean; synced: boolean; cwd: strin
   );
 }
 
+/** Tab mark, most important first: a command running, one that failed, one that finished while away, new output */
+function TabBadge({ panes, activity }: { panes: (PaneStatus["state"] | undefined)[]; activity?: "output" | "finished" }) {
+  if (panes.includes("running")) return <Loader2 size={11} aria-label="Executando" className="shrink-0 animate-spin text-primary" />;
+  if (panes.includes("error")) return <CircleX size={11} aria-label="Falhou" className="shrink-0 text-destructive" />;
+  if (activity === "finished") return <Check size={11} aria-label="Terminou" className="shrink-0 text-success" />;
+  if (activity === "output") return <span aria-label="Saída nova" className="size-1.5 shrink-0 rounded-full bg-primary shadow-[0_0_6px_var(--glow)]" />;
+  return null;
+}
+
+/** Status bar: what the focused pane's last command did */
+function PaneState({ status }: { status?: PaneStatus }) {
+  if (!status) return null;
+  if (status.state === "running")
+    return (
+      <span className="flex items-center gap-1 text-primary">
+        <Loader2 size={11} className="animate-spin" /> executando
+      </span>
+    );
+  if (status.state === "error")
+    return (
+      <span className="flex items-center gap-1 text-destructive">
+        <CircleX size={11} /> código {status.code}
+      </span>
+    );
+  return (
+    <span className="flex items-center gap-1 text-success">
+      <Check size={11} /> {status.state === "ok" ? "ok" : "terminou"}
+    </span>
+  );
+}
+
 export default function App() {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [active, setActive] = useState(0);
@@ -190,11 +261,19 @@ export default function App() {
   const [copyMode, setCopyMode] = useState(false);
   const [titles, setTitles] = useState<Record<number, string>>({});
   const [editing, setEditing] = useState<number | null>(null);
-  // Folder each new pane starts in: the focused pane's folder when it was created, or the saved one on restore
-  const startDir = useRef(new Map<number, string>());
-  // Same idea for profiles and restored layouts: the shell of each pane and the command it starts with
-  const startShell = useRef(new Map<number, ShellKind>());
-  const startCmd = useRef(new Map<number, string>());
+  // How each new pane starts, when not the defaults: the focused pane's folder when it was split,
+  // the profile's folder/shell/command/variables, or what was saved on restore
+  const starts = useRef(new Map<number, Partial<Start>>());
+  const [status, setStatus] = useState<Record<number, PaneStatus>>({});
+  // panes whose shell reported a prompt at least once: only those can be "running" (a custom prompt may never report)
+  const integrated = useRef(new Set<number>());
+  // panes opened by a profile with a command: their first prompt means "the command starts now"
+  const pendingCmd = useRef(new Set<number>());
+  // tabs out of view that printed something, or finished a command, since they were last shown
+  const [activity, setActivity] = useState<Record<number, "output" | "finished">>({});
+  const [paletteQuery, setPaletteQuery] = useState("");
+  const [projectsRoot, setProjectsRoot] = useState(() => localStorage.getItem(PROJECTS_KEY) ?? "");
+  const [projects, setProjects] = useState<string[]>([]);
   // first detach: explain where the window went, when it comes back
   const detachNotice = useRef(false);
   const [version, setVersion] = useState("");
@@ -215,8 +294,11 @@ export default function App() {
       .then(() => {
         const saved = loadLayout();
         if (saved) {
-          for (const [id, cwd] of Object.entries(saved.cwds ?? {})) startDir.current.set(+id, cwd);
-          for (const [id, sh] of Object.entries(saved.shells ?? {})) if (sh in SHELLS) startShell.current.set(+id, sh);
+          for (const t of saved.tabs)
+            for (const p of leaves(t.root)) {
+              const sh = saved.shells?.[p];
+              starts.current.set(p, { cwd: saved.cwds?.[p], shell: sh && sh in SHELLS ? sh : undefined, env: saved.envs?.[p] });
+            }
           const restored = saved.tabs.map((t) => ({ ...t, zoom: false, sync: false }));
           setTabs(restored);
           setActive(restored.some((t) => t.id === saved.active) ? saved.active : restored[0].id);
@@ -236,12 +318,16 @@ export default function App() {
   saveLayout.current = () => {
     const cwds: Record<number, string> = {};
     const shells: Record<number, ShellKind> = {};
+    const envs: Record<number, [string, string][]> = {};
     for (const t of tabs)
       for (const p of leaves(t.root)) {
-        cwds[p] = sessionCwd(p) ?? startDir.current.get(p) ?? home;
-        shells[p] = session(p)?.shell ?? startShell.current.get(p) ?? shell;
+        const st = starts.current.get(p);
+        cwds[p] = sessionCwd(p) ?? st?.cwd ?? home;
+        shells[p] = session(p)?.shell ?? st?.shell ?? shell;
+        if (st?.env?.length) envs[p] = st.env;
       }
-    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ tabs, active, cwds, shells } satisfies Saved));
+    // the profile commands are not saved: a restart should not run `npm run dev` again on its own
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ tabs, active, cwds, shells, envs } satisfies Saved));
   };
   // The window's X either detaches (hide, shells keep running) or quits, per Settings; read through a ref, so one listener is enough
   const onClose = useRef((_e: { preventDefault: () => void }) => {});
@@ -316,10 +402,11 @@ export default function App() {
   function openProfile(pr: Profile) {
     const commands = pr.commands.length ? pr.commands : [""];
     const ids = commands.map(() => newId());
+    const env = parseEnv(pr.env);
     ids.forEach((id, i) => {
-      if (pr.cwd.trim()) startDir.current.set(id, pr.cwd.trim());
-      startShell.current.set(id, pr.shell);
-      if (commands[i].trim()) startCmd.current.set(id, commands[i].trim());
+      const command = commands[i].trim() || undefined;
+      starts.current.set(id, { cwd: pr.cwd.trim() || undefined, shell: pr.shell, command, env });
+      if (command) pendingCmd.current.add(id);
     });
     const t: Tab = { id: newId(), root: layoutTree(ids, pr.layout), focus: ids[0], zoom: false, sync: false, name: pr.name || undefined };
     setTabs((ts) => [...ts, t]);
@@ -333,7 +420,33 @@ export default function App() {
   // New panes and tabs open in the focused pane's folder, when its prompt reported one
   function inheritDir(pane: number) {
     const cwd = tab && sessionCwd(tab.focus);
-    if (cwd) startDir.current.set(pane, cwd);
+    if (cwd) starts.current.set(pane, { cwd });
+  }
+
+  /** Sessionizer: a tab in a subfolder of the projects folder, named after it */
+  async function openProject(name: string) {
+    const t = { ...newTab(), name };
+    starts.current.set(t.focus, { cwd: await join(projectsRoot, name) });
+    setTabs((ts) => [...ts, t]);
+    setActive(t.id);
+  }
+
+  function openPalette(query = "") {
+    setPaletteQuery(query);
+    setPalette(true);
+  }
+
+  // The projects are read when the palette opens, so a new folder shows up without restarting
+  useEffect(() => {
+    if (palette && projectsRoot.trim()) invoke<string[]>("list_dirs", { root: projectsRoot.trim() }).then(setProjects, () => setProjects([]));
+  }, [palette, projectsRoot]);
+
+  /** prefix + Space: the panes of the tab side by side, stacked, or one big plus a stack, in turn */
+  function cycleLayout() {
+    if (!tab) return;
+    const next = LAYOUT_ORDER[(LAYOUT_ORDER.indexOf(tab.layout ?? "main") + 1) % LAYOUT_ORDER.length];
+    updateTab((t) => ({ ...t, root: layoutTree(leaves(t.root), next), layout: next, zoom: false }));
+    toast(`Painéis: ${LAYOUTS[next].toLowerCase()}`, { duration: 1500 });
   }
 
   function addTab() {
@@ -350,9 +463,10 @@ export default function App() {
   }
 
   function forget(pane: number) {
-    startDir.current.delete(pane);
-    startShell.current.delete(pane);
-    startCmd.current.delete(pane);
+    starts.current.delete(pane);
+    integrated.current.delete(pane);
+    pendingCmd.current.delete(pane);
+    setStatus(({ [pane]: _, ...rest }) => rest);
   }
 
   // Closing the last pane closes the tab; closing the last tab closes the app
@@ -432,7 +546,7 @@ export default function App() {
       return false;
     }
     if (e.ctrlKey && e.shiftKey && e.code === "KeyP") {
-      setPalette(true);
+      openPalette();
       return false;
     }
     if (e.ctrlKey && e.shiftKey && e.code === "KeyF") {
@@ -475,7 +589,19 @@ export default function App() {
     else if (e.key === ",") setEditing(tab.id);
     else if (e.key === "[") enterCopyMode();
     else if (e.key === "d") detach();
-    else if (e.key === ":") setPalette(true);
+    else if (e.key === ":") openPalette();
+    else if (e.key === " ") cycleLayout();
+    else if (e.key === "=") openPalette("colar");
+    else if (e.key === "]") {
+      if (buffers[0]) pasteInto(pane, buffers[0]);
+      else toast("Nada copiado ainda");
+    } else if (e.key === "f") {
+      if (projectsRoot.trim()) openPalette("projeto ");
+      else {
+        toast("Escolha a pasta de projetos nas Configurações");
+        setSettings(true);
+      }
+    }
     else if (e.key === "?") setHelp(true);
     return false;
   }
@@ -483,13 +609,50 @@ export default function App() {
   // Typed input goes to the pane, or to every pane of its tab when the tab is synced
   function onInput(pane: number, data: string) {
     const owner = tabs.find((t) => leaves(t.root).includes(pane));
-    for (const p of owner?.sync ? leaves(owner.root) : [pane]) writePane(p, data);
+    const targets = owner?.sync ? leaves(owner.root) : [pane];
+    for (const p of targets) writePane(p, data);
+    // Enter at a prompt starts a command; the next prompt (OSC 133;D) ends it
+    if (!data.includes("\r")) return;
+    const starting = targets.filter((p) => integrated.current.has(p) && status[p]?.state !== "running");
+    if (starting.length)
+      setStatus((st) => ({ ...st, ...Object.fromEntries(starting.map((p) => [p, { state: "running", since: Date.now() } as PaneStatus])) }));
   }
+
+  function onOutput(pane: number) {
+    const owner = tabs.find((t) => leaves(t.root).includes(pane));
+    if (owner && owner.id !== active && !activity[owner.id]) setActivity((a) => ({ ...a, [owner.id]: "output" }));
+  }
+
+  function onDone(pane: number, code: number | null) {
+    integrated.current.add(pane);
+    if (pendingCmd.current.delete(pane)) {
+      setStatus((st) => ({ ...st, [pane]: { state: "running", since: Date.now() } }));
+      return;
+    }
+    const prev = status[pane];
+    if (prev?.state !== "running") return; // the first prompt, or Enter inside a program
+    const state = code === null ? "done" : code === 0 ? "ok" : "error";
+    setStatus((st) => ({ ...st, [pane]: { state, code, since: Date.now() } }));
+    const owner = tabs.find((t) => leaves(t.root).includes(pane));
+    if (!owner) return;
+    const away = owner.id !== active || !document.hasFocus();
+    if (owner.id !== active) setActivity((a) => ({ ...a, [owner.id]: "finished" }));
+    const took = Date.now() - prev.since;
+    if (away && took >= NOTIFY_AFTER_MS)
+      notify(state === "error" ? `Comando falhou (código ${code})` : "Comando terminou", `${label(owner)} · ${duration(took)}`).catch(() => {});
+  }
+
+  // Looking at a tab clears its activity mark
+  useEffect(() => {
+    setActivity(({ [active]: _, ...rest }) => rest);
+  }, [active]);
 
   // No dependency array: the session handlers always see the latest state (re-assigned every render)
   useEffect(() => {
     handlers.key = onKey;
     handlers.input = onInput;
+    handlers.output = onOutput;
+    handlers.done = onDone;
     handlers.exit = closePane;
     handlers.title = (id, title) => setTitles((ts) => ({ ...ts, [id]: title }));
   });
@@ -518,6 +681,10 @@ export default function App() {
     setCloseAction(c);
     localStorage.setItem(CLOSE_KEY, c);
   }
+  function changeProjectsRoot(root: string) {
+    setProjectsRoot(root);
+    localStorage.setItem(PROJECTS_KEY, root);
+  }
   function changeTheme(t: Theme) {
     setTheme(t);
     localStorage.setItem(THEME_KEY, t);
@@ -541,6 +708,15 @@ export default function App() {
     { id: "swap-next", group: "Painéis", title: "Trocar com o próximo painel", icon: ArrowLeftRight, keywords: "mover swap", shortcut: P("}"), run: () => swapPane(1) },
     { id: "zoom", group: "Painéis", title: tab?.zoom ? "Sair do zoom" : "Zoom no painel", icon: Maximize2, shortcut: P("z"), run: toggleZoom },
     { id: "sync", group: "Painéis", title: tab?.sync ? "Parar de digitar em todos os painéis" : "Digitar em todos os painéis da aba", icon: Keyboard, keywords: "sincronizar synchronize", run: toggleSync },
+    { id: "layout", group: "Painéis", title: "Alternar arranjo dos painéis", icon: LayoutGrid, keywords: "layout grade", shortcut: P("Espaço"), run: cycleLayout },
+    ...LAYOUT_ORDER.map((l) => ({
+      id: `layout-${l}`,
+      group: "Painéis",
+      title: `Arranjo: ${LAYOUTS[l].toLowerCase()}`,
+      icon: LayoutGrid,
+      keywords: "layout",
+      run: () => updateTab((t) => ({ ...t, root: layoutTree(leaves(t.root), l), layout: l, zoom: false })),
+    })),
     { id: "close-pane", group: "Painéis", title: "Fechar painel", icon: X, shortcut: P("x"), run: () => tab && closePane(tab.focus) },
     { id: "new-tab", group: "Abas", title: "Nova aba", icon: Plus, shortcut: P("c"), run: addTab },
     { id: "next-tab", group: "Abas", title: "Próxima aba", icon: ArrowLeftRight, shortcut: P("n"), run: () => goTab(1) },
@@ -563,6 +739,22 @@ export default function App() {
     { id: "theme-dark", group: "Aparência", title: "Tema escuro", icon: Moon, run: () => changeTheme("dark") },
     { id: "theme-light", group: "Aparência", title: "Tema claro", icon: Sun, run: () => changeTheme("light") },
     { id: "theme-system", group: "Aparência", title: "Tema do sistema", icon: Sun, run: () => changeTheme("system") },
+    ...buffers.map((b, i) => ({
+      id: `buffer-${i}`,
+      group: "Histórico de cópias",
+      title: `Colar: ${b.replace(/\s+/g, " ").trim().slice(0, 60)}`,
+      icon: ClipboardPaste,
+      keywords: "buffer",
+      shortcut: i === 0 ? P("]") : undefined,
+      run: () => tab && pasteInto(tab.focus, b),
+    })),
+    ...projects.map((name) => ({
+      id: `project-${name}`,
+      group: "Projetos",
+      title: `Projeto: ${name}`,
+      icon: FolderGit2,
+      run: () => openProject(name),
+    })),
     ...profiles.map((pr) => ({
       id: `profile-${pr.id}`,
       group: "Perfis",
@@ -586,9 +778,7 @@ export default function App() {
           id={p.id}
           focused={p.id === tab?.focus}
           synced={!!tab?.sync}
-          cwd={startDir.current.get(p.id) ?? home}
-          shell={startShell.current.get(p.id) ?? shell}
-          command={startCmd.current.get(p.id)}
+          start={{ ...starts.current.get(p.id), cwd: starts.current.get(p.id)?.cwd ?? home, shell: starts.current.get(p.id)?.shell ?? shell }}
           onFocus={() => updateTab((t) => ({ ...t, focus: p.id }))}
         />
       );
@@ -654,6 +844,7 @@ export default function App() {
               )}
               {t.zoom && <Maximize2 size={11} className="shrink-0 text-primary" />}
               {t.sync && <Keyboard size={11} className="shrink-0 text-warning" />}
+              <TabBadge panes={leaves(t.root).map((p) => status[p]?.state)} activity={activity[t.id]} />
               <X
                 size={13}
                 aria-label="Fechar aba"
@@ -764,6 +955,7 @@ export default function App() {
               SINCRONIZADO
             </button>
           )}
+          {tab && <PaneState status={status[tab.focus]} />}
           {tab && (
             <span>
               [{index + 1}/{tabs.length}] {leaves(tab.root).length} {leaves(tab.root).length === 1 ? "painel" : "painéis"}
@@ -787,7 +979,7 @@ export default function App() {
             ))}
           </select>
         </footer>
-        <Palette open={palette} onOpenChange={(o) => backToTerminal(o, setPalette)} commands={commands} />
+        <Palette open={palette} onOpenChange={(o) => backToTerminal(o, setPalette)} commands={commands} initialQuery={paletteQuery} />
         <Settings
           open={settings}
           onOpenChange={(o) => backToTerminal(o, setSettings)}
@@ -797,6 +989,8 @@ export default function App() {
           onTheme={changeTheme}
           shell={shell}
           onShell={changeShell}
+          projectsRoot={projectsRoot}
+          onProjectsRoot={changeProjectsRoot}
           closeAction={closeAction}
           onCloseAction={changeCloseAction}
           profiles={profiles}

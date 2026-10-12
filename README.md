@@ -10,12 +10,17 @@
 
 - Abas e painéis divididos, redimensionáveis com o mouse
 - Teclas do tmux: prefixo `Ctrl+B`, depois `%` `"` `c` `x` `z` `n` `p` `o`, setas e `1-9` (`Ctrl+B ?` mostra todas)
-- PowerShell, PowerShell 7, cmd ou Git Bash (escolha na barra de status)
+- PowerShell, PowerShell 7, cmd, Git Bash ou WSL (escolha na barra de status)
 - Painel e aba novos abrem na pasta do painel atual
 - Renomear aba: duplo clique ou `Ctrl+B ,`
 - `Ctrl+C` com texto selecionado copia, `Ctrl+V` cola; botão direito copia a seleção ou cola
 - `Ctrl+clique` em links abre no navegador
 - `Ctrl +`, `Ctrl -` e `Ctrl 0` mudam o tamanho da fonte
+- Estado do último comando em cada painel (executando, ok, código de erro) e na aba; notificação do Windows quando um comando de mais de 10s termina numa aba escondida ou com o app em segundo plano
+- Ponto na aba quando um painel escondido imprime algo
+- Alternar o arranjo dos painéis: `Ctrl+B Espaço` (lado a lado, empilhados, um grande + pilha)
+- Projetos: escolha uma pasta de projetos e `Ctrl+B f` lista as subpastas para abrir uma aba nelas
+- Histórico de cópias: `Ctrl+B =` lista as últimas 10, `Ctrl+B ]` cola a mais recente (só na memória)
 - Paleta de comandos: `Ctrl+Shift+P` ou `Ctrl+B :`
 - Busca no terminal, rolagem inclusa: `Ctrl+Shift+F`
 - Modo cópia: `Ctrl+B [`, rolar com setas/`j`/`k`/PgUp/PgDn, `Enter` copia a seleção, `q` sai
@@ -23,7 +28,7 @@
 - Trocar painéis de lugar: `Ctrl+B {` e `}`
 - Reabre com as mesmas abas, painéis, pastas e shells
 - Fechar a janela só esconde o app na bandeja: os terminais continuam rodando e abrir o app de novo volta para eles (`Ctrl+B d` faz o mesmo, como o detach do tmux). Para sair: bandeja → Sair
-- Perfis: uma aba pronta com pasta, shell, arranjo dos painéis e um comando por painel (seta ao lado do `+`)
+- Perfis: uma aba pronta com pasta, shell, arranjo dos painéis, variáveis de ambiente e um comando por painel (seta ao lado do `+`)
 - Atualização automática pelas releases do GitHub
 - Configurações: prefixo (`Ctrl+B`, `Ctrl+A` ou `Ctrl+Espaço`), tema e shell
 - Tema claro e escuro, seguindo o sistema ou escolhido

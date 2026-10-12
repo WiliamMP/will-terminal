@@ -24,15 +24,18 @@ export type Session = {
   started: boolean;
 };
 
-// App sets these; a session calls them for keys (return false = consumed), typed input, title changes and exit
+// App sets these; a session calls them for keys (return false = consumed), typed input, output,
+// the end of a command (its exit code, null when the shell can't tell), title changes and exit
 export const handlers = {
   key: (_id: number, _e: KeyboardEvent) => true,
   input: (id: number, data: string) => writePane(id, data),
+  output: (_id: number) => {},
+  done: (_id: number, _code: number | null) => {},
   title: (_id: number, _title: string) => {},
   exit: (_id: number) => {},
 };
 
-export const SHELLS = { powershell: "PowerShell", pwsh: "PowerShell 7", cmd: "cmd", "git-bash": "Git Bash" };
+export const SHELLS = { powershell: "PowerShell", pwsh: "PowerShell 7", cmd: "cmd", "git-bash": "Git Bash", wsl: "WSL" };
 export type ShellKind = keyof typeof SHELLS;
 
 const FONT_KEY = "will-terminal.fontSize";
@@ -40,7 +43,12 @@ const DEFAULT_FONT = 13;
 let fontSize = Number(localStorage.getItem(FONT_KEY)) || DEFAULT_FONT;
 
 const sessions = new Map<number, Session>();
-const output = listen<{ id: number; data: string }>("pty-output", (e) => sessions.get(e.payload.id)?.term.write(e.payload.data));
+const output = listen<{ id: number; data: string }>("pty-output", (e) => {
+  const s = sessions.get(e.payload.id);
+  if (!s) return;
+  s.term.write(e.payload.data);
+  handlers.output(e.payload.id);
+});
 const exited = listen<number>("pty-exit", (e) => sessions.has(e.payload) && handlers.exit(e.payload));
 
 const css = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -72,8 +80,10 @@ export function applyTheme() {
   for (const s of sessions.values()) s.term.options.theme = t;
 }
 
-/** `command`: typed into the shell once it starts (profiles), as if the user did it */
-export function getSession(id: number, cwd: string, shell: ShellKind, command?: string): Session {
+/** How a pane starts. `command`: typed into the shell once it starts (profiles), as if the user did it. */
+export type Start = { cwd: string; shell: ShellKind; command?: string; env?: [string, string][] };
+
+export function getSession(id: number, { cwd, shell, command, env }: Start): Session {
   const existing = sessions.get(id);
   if (existing) return existing;
 
@@ -97,6 +107,13 @@ export function getSession(id: number, cwd: string, shell: ShellKind, command?: 
   term.parser.registerOscHandler(9, (data) => {
     if (data.startsWith("9;")) s.cwd = data.slice(2);
     return data.startsWith("9;");
+  });
+  // OSC 133;D[;code]: the prompt says the previous command ended (see pty.rs)
+  term.parser.registerOscHandler(133, (data) => {
+    if (!data.startsWith("D")) return false;
+    const code = Number.parseInt(data.split(";")[1]);
+    handlers.done(id, Number.isNaN(code) ? null : code);
+    return true;
   });
   // Right click: copies the selection, or pastes when there is none (like Windows Terminal)
   el.addEventListener("contextmenu", (e) => {
@@ -125,7 +142,7 @@ export function getSession(id: number, cwd: string, shell: ShellKind, command?: 
 
   // Listeners must exist before the shell starts: ConPTY's first output is a question xterm must answer
   Promise.all([output, exited])
-    .then(() => invoke("pty_spawn", { id, cwd, shellKind: shell, cols: term.cols, rows: term.rows }))
+    .then(() => invoke("pty_spawn", { id, cwd, shellKind: shell, env, cols: term.cols, rows: term.rows }))
     .then(
       () => {
         s.started = true;
@@ -147,12 +164,24 @@ export function writePane(id: number, data: string) {
   if (sessions.get(id)?.started) invoke("pty_write", { id, data });
 }
 
+// Copy history (tmux buffers): the last copies, newest first. Memory only: copies can hold secrets.
+const BUFFERS = 10;
+export const buffers: string[] = [];
+
 export function copySelection(id: number) {
   const term = sessions.get(id)?.term;
   if (!term?.hasSelection()) return;
-  navigator.clipboard.writeText(term.getSelection());
+  const text = term.getSelection();
+  navigator.clipboard.writeText(text);
   term.clearSelection();
+  const i = buffers.indexOf(text);
+  if (i >= 0) buffers.splice(i, 1);
+  buffers.unshift(text);
+  buffers.length = Math.min(buffers.length, BUFFERS);
 }
+
+/** Pastes like the user did it (bracketed paste included), so multi-line text does not run line by line */
+export const pasteInto = (id: number, text: string) => sessions.get(id)?.term.paste(text);
 
 export const session = (id: number) => sessions.get(id);
 export const sessionCwd = (id: number) => sessions.get(id)?.cwd;

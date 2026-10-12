@@ -3,15 +3,13 @@ import { FolderInput, Settings as Gear, Plus, Trash2, X } from "lucide-react";
 import { Dialog } from "radix-ui";
 import { toast } from "sonner";
 import type { Layout } from "../panes";
+import type { Profile } from "../profiles";
 import { SHELLS, type ShellKind } from "../session";
 import { Button, IconButton } from "./ui";
 
 export type Theme = "system" | "light" | "dark";
 export type PrefixKey = "b" | "a" | " ";
 export type CloseAction = "background" | "quit";
-
-/** A ready-made tab: its folder, shell, layout and one line per pane with the command it starts (empty = none) */
-export type Profile = { id: string; name: string; cwd: string; shell: ShellKind; layout: Layout; commands: string[] };
 
 export const PREFIXES: Record<PrefixKey, string> = { b: "Ctrl+B", a: "Ctrl+A", " ": "Ctrl+Espaço" };
 const THEMES: Record<Theme, string> = { system: "Seguir o sistema", light: "Claro", dark: "Escuro" };
@@ -29,6 +27,8 @@ type Props = {
   onShell: (s: ShellKind) => void;
   closeAction: CloseAction;
   onCloseAction: (c: CloseAction) => void;
+  projectsRoot: string;
+  onProjectsRoot: (root: string) => void;
   profiles: Profile[];
   onProfiles: (f: (ps: Profile[]) => Profile[]) => void;
   /** folder of the focused pane, for "use current folder" */
@@ -87,6 +87,17 @@ function ProfileForm({ profile, currentCwd, onChange }: { profile: Profile; curr
           className={`${input} mt-1 block w-full resize-y font-mono text-xs`}
         />
       </label>
+      <label className="block pt-1">
+        <span>Variáveis de ambiente</span>
+        <span className="ml-2 text-xs text-muted-foreground">NOME=valor, uma por linha</span>
+        <textarea
+          rows={2}
+          value={profile.env ?? ""}
+          placeholder={"NODE_ENV=development"}
+          onChange={(e) => set({ env: e.target.value })}
+          className={`${input} mt-1 block w-full resize-y font-mono text-xs`}
+        />
+      </label>
     </div>
   );
 }
@@ -134,6 +145,20 @@ export function Settings(p: Props) {
           <p className="pb-1 text-xs text-muted-foreground">
             Na bandeja, os terminais continuam rodando; abrir o app de novo volta para eles. Para sair de verdade: bandeja → Sair.
           </p>
+
+          <label className="flex items-center gap-3 py-1.5">
+            <span className="shrink-0">Pasta de projetos</span>
+            <input
+              value={p.projectsRoot}
+              placeholder="ex.: D:\Projetos"
+              onChange={(e) => p.onProjectsRoot(e.target.value)}
+              className={`${input} min-w-0 flex-1 font-mono text-xs`}
+            />
+            <IconButton label="Usar a pasta do painel atual" onClick={() => p.onProjectsRoot(p.currentCwd)} className="size-7">
+              <FolderInput size={15} />
+            </IconButton>
+          </label>
+          <p className="pb-1 text-xs text-muted-foreground">Cada subpasta vira um projeto na paleta, para abrir uma aba nela (prefixo + f).</p>
 
           <div className="mt-3 flex items-center justify-between border-t pt-3">
             <h3 className="font-medium">Perfis</h3>

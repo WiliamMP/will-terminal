@@ -1,4 +1,4 @@
-// Integrated terminal: a real shell (PowerShell, cmd, Git Bash) running in a
+// Integrated terminal: a real shell (PowerShell, cmd, Git Bash, WSL) running in a
 // pseudo-terminal (ConPTY on Windows), streamed to xterm.js in the window.
 // Each session lives in a map by id, like a list of TProcess objects.
 
@@ -29,14 +29,22 @@ struct Output {
     data: String,
 }
 
-// Each shell's prompt also prints OSC 9;9 with the current folder (same sequence
-// Windows Terminal uses), so a new pane can open where the focused one is.
-// PowerShell: wraps the prompt from the user's profile, which already ran.
-const PS_CWD: &str = r#"$__will_prompt = $function:prompt; function prompt { "$([char]27)]9;9;$($executionContext.SessionState.Path.CurrentLocation.ProviderPath)$([char]7)" + (& $__will_prompt) }"#;
+// Shell integration: every prompt prints two invisible sequences before itself.
+// - OSC 133;D;<exit code>: the previous command ended (FinalTerm / VS Code convention),
+//   for the ok/error badge and the "command finished" notification.
+// - OSC 9;9;<folder>: the current folder (same as Windows Terminal), so a new pane opens there.
+// PowerShell: wraps the prompt from the user's profile, which already ran. `$?` must be read first,
+// before anything else in the prompt resets it.
+const PS_PROMPT: &str = r#"$__will_prompt = $function:prompt; function prompt { $c = if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }; $e = [char]27; $b = [char]7; "$e]133;D;$c$b$e]9;9;$($executionContext.SessionState.Path.CurrentLocation.ProviderPath)$b" + (& $__will_prompt) }"#;
+
+// bash (Git Bash and WSL): `to_windows` turns $PWD into a Windows path (cygpath / wslpath)
+fn bash_prompt(to_windows: &str) -> String {
+    format!(r#"__c=$?; printf '\e]133;D;%s\e\\\e]9;9;%s\e\\' "$__c" "$({to_windows} -w "$PWD")""#)
+}
 
 fn powershell(exe: &str) -> CommandBuilder {
     let mut c = CommandBuilder::new(exe);
-    c.args(["-NoLogo", "-NoExit", "-Command", PS_CWD]);
+    c.args(["-NoLogo", "-NoExit", "-Command", PS_PROMPT]);
     c
 }
 
@@ -45,7 +53,8 @@ fn shell(kind: &str) -> CommandBuilder {
     match kind {
         "cmd" => {
             let mut c = CommandBuilder::new("cmd.exe");
-            c.env("PROMPT", r"$e]9;9;$P$e\$P$G");
+            // cmd's PROMPT can't read %ERRORLEVEL%: it says "ended" without a code
+            c.env("PROMPT", r"$e]133;D$e\$e]9;9;$P$e\$P$G");
             c
         }
         "pwsh" => powershell("pwsh.exe"),
@@ -54,8 +63,16 @@ fn shell(kind: &str) -> CommandBuilder {
             let mut c = CommandBuilder::new(format!(r"{base}\Git\bin\bash.exe"));
             c.arg("--login");
             c.arg("-i");
-            // ponytail: a ~/.bashrc that sets its own PROMPT_COMMAND wins and the folder is not reported
-            c.env("PROMPT_COMMAND", r#"printf '\e]9;9;%s\e\\' "$(cygpath -w "$PWD")""#);
+            // ponytail: a ~/.bashrc that sets its own PROMPT_COMMAND wins and the folder/exit code are not reported
+            c.env("PROMPT_COMMAND", bash_prompt("cygpath"));
+            c
+        }
+        "wsl" => {
+            let mut c = CommandBuilder::new("wsl.exe");
+            c.env("PROMPT_COMMAND", bash_prompt("wslpath"));
+            // WSLENV lists the Windows variables that cross into Linux (/u = only this direction)
+            let wslenv = std::env::var("WSLENV").unwrap_or_default();
+            c.env("WSLENV", if wslenv.is_empty() { "PROMPT_COMMAND/u".into() } else { format!("{wslenv}:PROMPT_COMMAND/u") });
             c
         }
         _ => powershell("powershell.exe"),
@@ -85,6 +102,7 @@ pub fn pty_spawn(
     id: u32,
     cwd: String,
     shell_kind: String,
+    env: Option<Vec<(String, String)>>,
     cols: u16,
     rows: u16,
 ) -> Res<()> {
@@ -97,6 +115,10 @@ pub fn pty_spawn(
         })
         .map_err(|e| e.to_string())?;
     let mut cmd = shell(&shell_kind);
+    // profile variables; WSL only sees them if the profile also lists them in WSLENV
+    for (k, v) in env.unwrap_or_default() {
+        cmd.env(k, v);
+    }
     // a folder that is gone (or a PowerShell drive like HKLM:) opens in the user folder instead of failing
     if std::path::Path::new(&cwd).is_dir() {
         cmd.cwd(&cwd);
@@ -217,15 +239,51 @@ mod tests {
         all
     }
 
-    /// The prompts report their folder through ConPTY, for "new pane in the same folder"
+    /// The prompts report their folder and the last exit code through ConPTY
     #[test]
-    fn prompts_report_the_folder() {
+    fn prompts_report_folder_and_exit_code() {
         let dir = std::env::temp_dir();
         let want = format!("\x1b]9;9;{}", dir.to_string_lossy().trim_end_matches('\\'));
-        for kind in ["powershell", "cmd"] {
+        for (kind, end) in [("powershell", "\x1b]133;D;0"), ("cmd", "\x1b]133;D")] {
             let out = read_until(shell(kind), &want);
             assert!(out.contains(&want), "{kind}: {out:?}");
+            assert!(out.contains(end), "{kind}: {out:?}");
         }
+    }
+
+    /// A failing command shows up as a non-zero code in the next prompt
+    #[test]
+    fn powershell_reports_a_failure() {
+        let mut cmd = CommandBuilder::new("powershell.exe");
+        // the failing command runs right after the prompt is installed, before the first prompt
+        cmd.args(["-NoLogo", "-NoExit", "-Command", &format!("{PS_PROMPT}; cmd /c exit 3")]);
+        let out = read_until(cmd, "\x1b]133;D;3");
+        assert!(out.contains("\x1b]133;D;3"), "{out:?}");
+    }
+
+    /// Git Bash, when installed: same two sequences from PROMPT_COMMAND
+    #[test]
+    fn git_bash_reports_folder_and_exit_code() {
+        let base = std::env::var("ProgramFiles").unwrap_or_default();
+        if !std::path::Path::new(&format!(r"{base}\Git\bin\bash.exe")).exists() {
+            return;
+        }
+        let out = read_until(shell("git-bash"), "\x1b]9;9;");
+        assert!(out.contains("\x1b]133;D;0\x1b\\\x1b]9;9;"), "{out:?}");
+    }
+
+    /// WSL, when a distro is installed: PROMPT_COMMAND crosses into Linux through WSLENV
+    #[test]
+    fn wsl_reports_folder_and_exit_code() {
+        let has_distro = std::process::Command::new("wsl.exe")
+            .args(["--list", "--quiet"])
+            .output()
+            .is_ok_and(|o| o.status.success() && o.stdout.iter().any(|b| b.is_ascii_alphanumeric()));
+        if !has_distro {
+            return;
+        }
+        let out = read_until(shell("wsl"), "\x1b]9;9;");
+        assert!(out.contains("\x1b]133;D;0\x1b\\\x1b]9;9;"), "{out:?}");
     }
 
     /// Real shell in a pty: runs a command and reads its output
