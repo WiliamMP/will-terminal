@@ -2,21 +2,24 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { toast } from "sonner";
+import { isReply } from "./panes";
 
 // Shell sessions live here, outside React: splitting a pane moves it to another
 // place in the tree, which remounts its component. If the component owned the
 // shell, every split would kill it. The component only borrows `el`.
 
 // cwd: last folder the shell's prompt reported (OSC 9;9, see pty.rs)
-export type Session = { term: Terminal; fit: FitAddon; el: HTMLDivElement; cwd: string };
+export type Session = { term: Terminal; fit: FitAddon; search: SearchAddon; el: HTMLDivElement; cwd: string; started: boolean };
 
-// App sets these; a session calls them for keys (return false = consumed), title changes and exit
+// App sets these; a session calls them for keys (return false = consumed), typed input, title changes and exit
 export const handlers = {
   key: (_id: number, _e: KeyboardEvent) => true,
+  input: (id: number, data: string) => writePane(id, data),
   title: (_id: number, _title: string) => {},
   exit: (_id: number) => {},
 };
@@ -32,27 +35,33 @@ const sessions = new Map<number, Session>();
 const output = listen<{ id: number; data: string }>("pty-output", (e) => sessions.get(e.payload.id)?.term.write(e.payload.data));
 const exited = listen<number>("pty-exit", (e) => sessions.has(e.payload) && handlers.exit(e.payload));
 
+const css = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
 // Colors from the app theme (CSS variables), so the terminal matches Neon light/dark
 function theme() {
-  const css = getComputedStyle(document.documentElement);
-  const v = (name: string) => css.getPropertyValue(name).trim();
   return {
-    background: v("--background"),
-    foreground: v("--foreground"),
-    cursor: v("--primary"),
-    cursorAccent: v("--background"),
-    selectionBackground: v("--primary") + "55",
+    background: css("--background"),
+    foreground: css("--foreground"),
+    cursor: css("--primary"),
+    cursorAccent: css("--background"),
+    selectionBackground: css("--primary") + "55",
     black: "#1e2230",
-    red: v("--destructive"),
-    green: v("--success"),
-    yellow: v("--warning"),
-    blue: v("--lane-2"),
-    magenta: v("--primary"),
-    cyan: v("--lane-2"),
-    white: v("--foreground"),
-    brightBlack: v("--muted-foreground"),
-    brightMagenta: v("--accent-foreground"),
+    red: css("--destructive"),
+    green: css("--success"),
+    yellow: css("--warning"),
+    blue: css("--lane-2"),
+    magenta: css("--primary"),
+    cyan: css("--lane-2"),
+    white: css("--foreground"),
+    brightBlack: css("--muted-foreground"),
+    brightMagenta: css("--accent-foreground"),
   };
+}
+
+/** After the light/dark class changes: repaint every terminal with the new colors */
+export function applyTheme() {
+  const t = theme();
+  for (const s of sessions.values()) s.term.options.theme = t;
 }
 
 export function getSession(id: number, cwd: string, shell: ShellKind): Session {
@@ -69,11 +78,13 @@ export function getSession(id: number, cwd: string, shell: ShellKind): Session {
     theme: theme(),
   });
   const fit = new FitAddon();
+  const search = new SearchAddon();
   term.loadAddon(fit);
+  term.loadAddon(search);
   // Ctrl+click opens in the browser, so a plain click can still select text
   term.loadAddon(new WebLinksAddon((e, url) => e.ctrlKey && openUrl(url)));
   term.open(el);
-  const s = { term, fit, el, cwd };
+  const s: Session = { term, fit, search, el, cwd, started: false };
   term.parser.registerOscHandler(9, (data) => {
     if (data.startsWith("9;")) s.cwd = data.slice(2);
     return data.startsWith("9;");
@@ -81,7 +92,7 @@ export function getSession(id: number, cwd: string, shell: ShellKind): Session {
   // Right click: copies the selection, or pastes when there is none (like Windows Terminal)
   el.addEventListener("contextmenu", (e) => {
     e.preventDefault();
-    if (term.hasSelection()) copy(term);
+    if (term.hasSelection()) copySelection(id);
     else navigator.clipboard.readText().then((t) => term.paste(t), (err) => toast.error(String(err)));
   });
   sessions.set(id, s);
@@ -91,7 +102,7 @@ export function getSession(id: number, cwd: string, shell: ShellKind): Session {
     if (e.type !== "keydown") return true;
     // Ctrl+C with a selection copies (like Windows Terminal); without one it is the usual interrupt
     if (e.ctrlKey && !e.shiftKey && e.key === "c" && term.hasSelection()) {
-      copy(term);
+      copySelection(id);
       e.preventDefault();
       return false;
     }
@@ -103,29 +114,46 @@ export function getSession(id: number, cwd: string, shell: ShellKind): Session {
   });
   term.onTitleChange((t) => handlers.title(id, t));
 
-  let started = false;
   // Listeners must exist before the shell starts: ConPTY's first output is a question xterm must answer
   Promise.all([output, exited])
     .then(() => invoke("pty_spawn", { id, cwd, shellKind: shell, cols: term.cols, rows: term.rows }))
     .then(
-      () => (started = true),
+      () => (s.started = true),
       (err) => {
         toast.error(String(err));
         handlers.exit(id);
       },
     );
-  term.onData((data) => started && invoke("pty_write", { id, data }));
-  term.onResize(({ cols, rows }) => started && invoke("pty_resize", { id, cols, rows }));
+  // xterm's own answers (cursor position, device attributes, focus) belong to this pane only, never to synced ones
+  term.onData((data) => (isReply(data) ? writePane(id, data) : handlers.input(id, data)));
+  term.onResize(({ cols, rows }) => s.started && invoke("pty_resize", { id, cols, rows }));
   return s;
 }
 
-function copy(term: Terminal) {
+export function writePane(id: number, data: string) {
+  if (sessions.get(id)?.started) invoke("pty_write", { id, data });
+}
+
+export function copySelection(id: number) {
+  const term = sessions.get(id)?.term;
+  if (!term?.hasSelection()) return;
   navigator.clipboard.writeText(term.getSelection());
   term.clearSelection();
 }
 
+export const session = (id: number) => sessions.get(id);
 export const sessionCwd = (id: number) => sessions.get(id)?.cwd;
 export const focusSession = (id: number) => sessions.get(id)?.term.focus();
+
+/** Search options with the Neon colors; decorations need #RRGGBB */
+export const searchOptions = () => ({
+  decorations: {
+    matchBackground: css("--muted").slice(0, 7),
+    matchOverviewRuler: css("--muted-foreground").slice(0, 7),
+    activeMatchBackground: css("--primary").slice(0, 7),
+    activeMatchColorOverviewRuler: css("--primary").slice(0, 7),
+  },
+});
 
 /** delta = +1 / -1, or 0 to go back to the default; applies to every open terminal */
 export function zoomFont(delta: number) {

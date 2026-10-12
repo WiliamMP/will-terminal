@@ -50,3 +50,21 @@ export function neighbor(rects: Map<number, Rect>, from: number, dir: Dir): numb
   }
   return best;
 }
+
+/** Exchanges the places of two leaves (tmux Ctrl+B { and }) */
+export function swap(p: Pane, x: number, y: number): Pane {
+  if (p.kind === "leaf") return p.id === x ? { ...p, id: y } : p.id === y ? { ...p, id: x } : p;
+  return { ...p, a: swap(p.a, x, y), b: swap(p.b, x, y) };
+}
+
+/** A saved tree read back from disk: anything that is not a well-formed tree is rejected */
+export function isPane(v: unknown): v is Pane {
+  const p = v as Pane;
+  if (typeof p?.id !== "number") return false;
+  if (p.kind === "leaf") return true;
+  return p.kind === "split" && (p.dir === "row" || p.dir === "col") && isPane(p.a) && isPane(p.b);
+}
+
+/** Terminal replies to the shell's questions (cursor position, device attributes, focus), as opposed to keys
+ *  the user typed. Synced panes get only typed keys: a reply sent to the wrong shell shows up as garbage. */
+export const isReply = (data: string) => /^\x1b\[(\??[\d;]*[Rc]|[IO])$/.test(data);

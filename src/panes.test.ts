@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { leaves, neighbor, remove, split, type Pane } from "./panes";
+import { isPane, isReply, leaves, neighbor, remove, split, swap, type Pane } from "./panes";
 
 const leaf = (id: number): Pane => ({ kind: "leaf", id });
 
@@ -26,4 +26,23 @@ test("neighbor picks the closest pane fully in that direction", () => {
   expect(neighbor(rects, 2, "down")).toBe(3);
   expect(neighbor(rects, 3, "left")).toBe(1);
   expect(neighbor(rects, 1, "left")).toBeUndefined();
+});
+
+test("swap exchanges two leaves and keeps the shape", () => {
+  const p = split(split(leaf(1), 1, "row", 2), 2, "col", 3);
+  expect(leaves(swap(p, 1, 3))).toEqual([3, 2, 1]);
+});
+
+test("isPane accepts saved trees and rejects junk", () => {
+  expect(isPane(split(leaf(1), 1, "row", 2))).toBe(true);
+  expect(isPane({ kind: "split", id: 1, dir: "row", a: leaf(1) })).toBe(false);
+  expect(isPane(null)).toBe(false);
+});
+
+test("isReply tells terminal answers from typed keys", () => {
+  expect(isReply("\x1b[12;40R")).toBe(true); // cursor position
+  expect(isReply("\x1b[?1;2c")).toBe(true); // device attributes
+  expect(isReply("\x1b[I")).toBe(true); // focus in
+  expect(isReply("\x1b[A")).toBe(false); // arrow up
+  expect(isReply("ls\r")).toBe(false);
 });

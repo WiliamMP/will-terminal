@@ -16,7 +16,14 @@
 - `Ctrl+C` com texto selecionado copia, `Ctrl+V` cola; botão direito copia a seleção ou cola
 - `Ctrl+clique` em links abre no navegador
 - `Ctrl +`, `Ctrl -` e `Ctrl 0` mudam o tamanho da fonte
-- Tema claro e escuro, seguindo o sistema
+- Paleta de comandos: `Ctrl+Shift+P` ou `Ctrl+B :`
+- Busca no terminal, rolagem inclusa: `Ctrl+Shift+F`
+- Modo cópia: `Ctrl+B [`, rolar com setas/`j`/`k`/PgUp/PgDn, `Enter` copia a seleção, `q` sai
+- Digitar em todos os painéis da aba ao mesmo tempo (pela paleta)
+- Trocar painéis de lugar: `Ctrl+B {` e `}`
+- Reabre com as mesmas abas, painéis e pastas
+- Configurações: prefixo (`Ctrl+B`, `Ctrl+A` ou `Ctrl+Espaço`), tema e shell
+- Tema claro e escuro, seguindo o sistema ou escolhido
 
 ## Como rodar
 
