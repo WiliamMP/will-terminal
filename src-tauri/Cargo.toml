@@ -1,0 +1,28 @@
+[package]
+name = "will-terminal"
+version = "0.1.0"
+description = "Terminal multiplexer for Windows"
+authors = ["Wiliam Patricio"]
+edition = "2021"
+license = "MIT"
+
+[lib]
+# The `_lib` suffix avoids a name clash with the bin on Windows (cargo#8519)
+name = "will_terminal_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.9"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
