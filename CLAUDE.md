@@ -32,3 +32,7 @@ npx tsc --noEmit -p .
 ```
 
 CI em `.github/workflows/ci.yml`; release por tag `v*` em `release.yml`.
+
+Teste visual: skill `run-will-terminal` (`scripts/run-debug.mjs` + `scripts/drive.mjs`), que abre uma cópia de teste e a controla pelo CDP.
+
+Instalador: só NSIS; `src-tauri/hooks.nsh` põe a pasta do app no PATH do usuário (e tira ao desinstalar).

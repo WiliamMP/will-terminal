@@ -54,7 +54,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "nsis"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -62,6 +64,21 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "publisher": "WiliamMP",
+    "shortDescription": "Terminal com abas e painéis estilo tmux, tema Neon",
+    "longDescription": "Terminal para Windows com abas, painéis e teclas do tmux: PowerShell, cmd, Git Bash e WSL, perfis, sessões em segundo plano e estado de cada comando.",
+    "copyright": "© 2026 WiliamMP",
+    "category": "DeveloperTool",
+    "windows": {
+      "nsis": {
+        "languages": [
+          "PortugueseBR"
+        ],
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "./hooks.nsh"
+      }
+    },
     "createUpdaterArtifacts": true
   },
   "plugins": {

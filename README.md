@@ -24,7 +24,7 @@
 - Shell que termina com erro não some: o painel fica com a saída e o código, `Enter` reinicia. `Ctrl+B R` reinicia qualquer painel (mesma pasta, mesmo comando inicial)
 - Gravar a saída de um painel em `.log` (texto puro): `Ctrl+B P` liga e desliga; os arquivos ficam em `%LOCALAPPDATA%\com.wiliammp.will-terminal\logs`
 - Terminal flutuante por cima do layout: `Ctrl+B t` mostra e esconde, `exit` fecha
-- Linha de comando: `will-terminal --perfil dev`, `--projeto will-repo`, `--cmd "npm test" --pasta .` (com o app aberto, a aba abre nele)
+- Linha de comando: `will-terminal --perfil dev`, `--projeto will-repo`, `--cmd "npm test" --pasta .` (com o app aberto, a aba abre nele). O instalador coloca o app no PATH do usuário
 - Paleta de comandos: `Ctrl+Shift+P` ou `Ctrl+B :`
 - Busca no terminal, rolagem inclusa: `Ctrl+Shift+F`
 - Modo cópia: `Ctrl+B [`, rolar com setas/`j`/`k`/PgUp/PgDn, `Enter` copia a seleção, `q` sai
@@ -45,6 +45,10 @@ npm run tauri dev
 ```
 
 Instalador: `npm run tauri build` (fica em `src-tauri/target/release/bundle/`).
+
+## Testar no app de verdade
+
+`node scripts/run-debug.mjs` abre uma cópia de teste com a porta de depuração do WebView2, e `node scripts/drive.mjs` a controla (teclas, cliques, capturas de tela). Detalhes em `.claude/skills/run-will-terminal/SKILL.md`.
 
 ## Release
 
