@@ -7,6 +7,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { toast } from "sonner";
+import { decodeCmd } from "./history";
 import { isReply } from "./panes";
 
 // Shell sessions live here, outside React: splitting a pane moves it to another
@@ -22,6 +23,8 @@ export type Session = {
   cwd: string;
   shell: ShellKind;
   started: boolean;
+  /** the command line the prompt reported (OSC 7777), until its 133;D */
+  lastCommand?: string;
   /** start command waiting for the first prompt */
   pendingCommand?: string;
   /** how it started, to start it again the same way (restart) */
@@ -37,7 +40,7 @@ export const handlers = {
   key: (_id: number, _e: KeyboardEvent) => true,
   input: (id: number, data: string) => writePane(id, data),
   output: (_id: number) => {},
-  done: (_id: number, _code: number | null) => {},
+  done: (_id: number, _code: number | null, _command?: string) => {},
   title: (_id: number, _title: string) => {},
   exit: (_id: number, _code: number | null) => {},
 };
@@ -134,7 +137,15 @@ export function getSession(id: number, start: Start): Session {
     if (!data.startsWith("D")) return false;
     sendPendingCommand(id);
     const code = Number.parseInt(data.split(";")[1]);
-    handlers.done(id, Number.isNaN(code) ? null : code);
+    const command = s.lastCommand;
+    s.lastCommand = undefined;
+    handlers.done(id, Number.isNaN(code) ? null : code, command);
+    return true;
+  });
+  // OSC 7777;cmd;<base64>: the command line that just ran, sent right before its 133;D
+  term.parser.registerOscHandler(7777, (data) => {
+    if (!data.startsWith("cmd;")) return false;
+    s.lastCommand = decodeCmd(data.slice(4)) || undefined;
     return true;
   });
   // Right click: copies the selection, or pastes when there is none (like Windows Terminal)
@@ -254,6 +265,18 @@ export function copySelection(id: number) {
 export const pasteInto = (id: number, text: string) => sessions.get(id)?.term.paste(text);
 
 export const session = (id: number) => sessions.get(id);
+
+/** The last `n` non-empty lines up to the cursor: the preview in the tree view */
+export function previewLines(id: number, n: number): string[] {
+  const buf = sessions.get(id)?.term.buffer.active;
+  if (!buf) return [];
+  const out: string[] = [];
+  for (let y = buf.baseY + buf.cursorY; y >= 0 && out.length < n; y--) {
+    const line = buf.getLine(y)?.translateToString(true).trimEnd();
+    if (line) out.unshift(line);
+  }
+  return out;
+}
 export const sessionCwd = (id: number) => sessions.get(id)?.cwd;
 export const focusSession = (id: number) => sessions.get(id)?.term.focus();
 

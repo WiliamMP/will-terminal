@@ -83,17 +83,23 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-// Shell integration: every prompt prints two invisible sequences before itself.
+// Shell integration: every prompt prints invisible sequences before itself.
+// - OSC 7777;cmd;<base64>: the command that just ran, read from the shell's own history, for the
+//   command history. Only when the history grew: an empty Enter adds nothing.
 // - OSC 133;D;<exit code>: the previous command ended (FinalTerm / VS Code convention),
 //   for the ok/error badge and the "command finished" notification.
 // - OSC 9;9;<folder>: the current folder (same as Windows Terminal), so a new pane opens there.
 // PowerShell: wraps the prompt from the user's profile, which already ran. `$?` must be read first,
-// before anything else in the prompt resets it.
-const PS_PROMPT: &str = r#"$__will_prompt = $function:prompt; function prompt { $c = if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }; $e = [char]27; $b = [char]7; "$e]133;D;$c$b$e]9;9;$($executionContext.SessionState.Path.CurrentLocation.ProviderPath)$b" + (& $__will_prompt) }"#;
+// before anything else in the prompt resets it. An empty Enter reports 0, not the last failure again.
+// The first prompt only notes where the history is: this very script is in it.
+const PS_PROMPT: &str = r#"$__will_prompt = $function:prompt; $global:__will_hid = -1; function prompt { $c = if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }; $e = [char]27; $b = [char]7; $s = ''; $h = Get-History -Count 1; if ($global:__will_hid -lt 0) { $global:__will_hid = if ($h) { $h.Id } else { 0 } } elseif ($h -and $h.Id -ne $global:__will_hid) { $global:__will_hid = $h.Id; $s = "$e]7777;cmd;" + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($h.CommandLine)) + $b } elseif ($h) { $c = 0 }; "$s$e]133;D;$c$b$e]9;9;$($executionContext.SessionState.Path.CurrentLocation.ProviderPath)$b" + (& $__will_prompt) }"#;
 
 // bash (Git Bash and WSL): `to_windows` turns $PWD into a Windows path (cygpath / wslpath)
+// ponytail: with HISTCONTROL=ignoredups a repeated command is not in the history, so it is not recorded
 fn bash_prompt(to_windows: &str) -> String {
-    format!(r#"__c=$?; printf '\e]133;D;%s\e\\\e]9;9;%s\e\\' "$__c" "$({to_windows} -w "$PWD")""#)
+    format!(
+        r#"__c=$?; __n=$(history 1 | sed 's/^ *\([0-9]*\).*/\1/'); if [ -n "$__n" ] && [ "$__n" != "$__will_n" ]; then __will_n=$__n; printf '\e]7777;cmd;%s\a' "$(printf %s "$(history 1 | sed 's/^ *[0-9]* *//')" | base64 | tr -d '\n')"; fi; printf '\e]133;D;%s\e\\\e]9;9;%s\e\\' "$__c" "$({to_windows} -w "$PWD")""#
+    )
 }
 
 fn powershell(exe: &str) -> CommandBuilder {
@@ -339,7 +345,12 @@ mod tests {
     }
 
     /// Real shell in a pty until `want` shows up in its output (or 15s)
-    fn read_until(mut cmd: CommandBuilder, want: &str) -> String {
+    fn read_until(cmd: CommandBuilder, want: &str) -> String {
+        interact(cmd, &[(want, "")])
+    }
+
+    /// Real shell in a pty: for each step, waits for `wait` in the new output (or 15s), then types `send`
+    fn interact(mut cmd: CommandBuilder, steps: &[(&str, &str)]) -> String {
         let pair = native_pty_system()
             .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
             .unwrap();
@@ -359,14 +370,53 @@ mod tests {
             }
         });
         let mut all = String::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !all.contains(want) && std::time::Instant::now() < deadline {
-            if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                all.push_str(&chunk);
+        let mut from = 0;
+        for (wait, send) in steps {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !all[from..].contains(wait) && std::time::Instant::now() < deadline {
+                if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    all.push_str(&chunk);
+                }
             }
+            if let Some(i) = all[from..].find(wait) {
+                from += i + wait.len();
+            }
+            writer.write_all(send.as_bytes()).unwrap();
         }
         let _ = child.kill();
         all
+    }
+
+    /// The prompt reports the command that ran (base64 of "echo hi"), and an empty Enter reports neither a command
+    /// nor the previous failure
+    #[test]
+    fn powershell_reports_the_command_line() {
+        let out = interact(
+            shell("powershell"),
+            &[
+                ("\x1b]9;9;", "echo hi\r"),
+                ("\x1b]7777;cmd;ZWNobyBoaQ==", "cmd /c exit 4\r"),
+                ("\x1b]133;D;4", "\r"),
+                ("\x1b]133;D;", ""),
+            ],
+        );
+        // the first prompt reports no command (the -Command that installs the prompt is in the history)
+        assert_eq!(out.matches("\x1b]7777;cmd;").count(), 2, "{out:?}");
+        let echo = out.find("\x1b]7777;cmd;ZWNobyBoaQ==").unwrap();
+        assert!(out[echo..].find("\x1b]133;D;0") < out[echo..].find("\x1b]133;D;4"), "{out:?}");
+        let after_empty_enter = &out[out.rfind("\x1b]133;D;4").unwrap() + 1..];
+        assert!(after_empty_enter.contains("\x1b]133;D;0"), "{out:?}");
+    }
+
+    #[test]
+    fn git_bash_reports_the_command_line() {
+        let base = std::env::var("ProgramFiles").unwrap_or_default();
+        if !std::path::Path::new(&format!(r"{base}\Git\bin\bash.exe")).exists() {
+            return;
+        }
+        let out = interact(shell("git-bash"), &[("\x1b]9;9;", "echo hi\r"), ("\x1b]7777;cmd;ZWNobyBoaQ==", ""), ("\x1b]133;D;", "")]);
+        let echo = out.find("\x1b]7777;cmd;ZWNobyBoaQ==\x07").expect(&out);
+        assert!(out[echo..].contains("\x1b]133;D;0"), "{out:?}");
     }
 
     /// The prompts report their folder and the last exit code through ConPTY

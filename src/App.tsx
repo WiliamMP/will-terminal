@@ -9,6 +9,9 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { cn } from "cn";
 import {
   AppWindow,
+  History,
+  ListTree,
+  Play,
   ArrowLeftRight,
   Check,
   CircleDot,
@@ -46,7 +49,10 @@ import { Group, Panel, Separator } from "react-resizable-panels";
 import { Toaster, toast } from "sonner";
 import type { Command } from "./commands";
 import { Palette } from "./components/Palette";
+import { BatchRun } from "./components/BatchRun";
 import { SearchBar } from "./components/SearchBar";
+import { TreeView, type TabInfo } from "./components/TreeView";
+import { addHistory, latestRuns, loadHistory, saveHistory, type HistoryEntry } from "./history";
 import { LAYOUTS, PREFIXES, Settings, type CloseAction, type PrefixKey, type Theme } from "./components/Settings";
 import { IconButton } from "./components/ui";
 import { dragWindow, WindowControls } from "./components/WindowControls";
@@ -81,7 +87,11 @@ type Tab = { id: number; root: Pane; focus: number; zoom: boolean; sync: boolean
 
 // What the shell integration (OSC 133, see pty.rs) says about a pane's last command.
 // "done" = ended, but the shell can't tell the exit code (cmd).
-type PaneStatus = { state: "running" | "ok" | "error" | "done"; code?: number | null; since: number };
+// cwd: where a running command started, for the command history; before: the status before it started
+type PaneStatus = { state: "running" | "ok" | "error" | "done"; code?: number | null; since: number; cwd?: string; before?: PaneStatus };
+
+// shells whose prompt reports the command line (OSC 7777): for them, a prompt with no command was an empty Enter
+const REPORTS_COMMANDS: ShellKind[] = ["powershell", "pwsh", "git-bash", "wsl"];
 
 const SHELL_KEY = "will-terminal.shell";
 const PREFIX_KEY = "will-terminal.prefix";
@@ -120,6 +130,9 @@ const BINDINGS: [string, string][] = [
   ["P", "Gravar a saída do painel em arquivo"],
   ["d", "Desanexar: esconde na bandeja, os terminais continuam"],
   [":", "Paleta de comandos"],
+  ["w", "Abas e painéis (com prévia)"],
+  ["h", "Histórico de comandos"],
+  ["e", "Executar em vários painéis"],
   ["?", "Esta ajuda"],
 ];
 const GLOBAL_BINDINGS: [string, string][] = [
@@ -297,6 +310,9 @@ export default function App() {
   const [logging, setLogging] = useState<Record<number, string>>({});
   // the floating scratch terminal: one shell kept while hidden, gone when it exits
   const [popup, setPopup] = useState<{ id: number; visible: boolean } | null>(null);
+  const [history, setHistoryState] = useState<HistoryEntry[]>(loadHistory);
+  const [tree, setTree] = useState(false);
+  const [batch, setBatch] = useState(false);
   const [projectsRoot, setProjectsRoot] = useState(() => localStorage.getItem(PROJECTS_KEY) ?? "");
   const [projects, setProjects] = useState<string[]>([]);
   // first detach: explain where the window went, when it comes back
@@ -731,6 +747,9 @@ export default function App() {
       }
     }
     else if (e.key === "?") setHelp(true);
+    else if (e.key === "w") setTree(true);
+    else if (e.key === "h") openPalette("histórico de comandos ");
+    else if (e.key === "e") setBatch(true);
     return false;
   }
 
@@ -740,10 +759,18 @@ export default function App() {
     const targets = owner?.sync ? leaves(owner.root) : [pane];
     for (const p of targets) writePane(p, data);
     // Enter at a prompt starts a command; the next prompt (OSC 133;D) ends it
-    if (!data.includes("\r")) return;
-    const starting = targets.filter((p) => integrated.current.has(p) && status[p]?.state !== "running");
+    if (data.includes("\r")) markRunning(targets);
+  }
+
+  function markRunning(panes: number[]) {
+    const starting = panes.filter((p) => integrated.current.has(p) && status[p]?.state !== "running");
     if (starting.length)
-      setStatus((st) => ({ ...st, ...Object.fromEntries(starting.map((p) => [p, { state: "running", since: Date.now() } as PaneStatus])) }));
+      setStatus((st) => ({
+        ...st,
+        ...Object.fromEntries(
+          starting.map((p) => [p, { state: "running", since: Date.now(), cwd: sessionCwd(p), before: st[p] } as PaneStatus]),
+        ),
+      }));
   }
 
   function onOutput(pane: number) {
@@ -751,23 +778,73 @@ export default function App() {
     if (owner && owner.id !== active && !activity[owner.id]) setActivity((a) => ({ ...a, [owner.id]: "output" }));
   }
 
-  function onDone(pane: number, code: number | null) {
+  function onDone(pane: number, code: number | null, command?: string) {
     integrated.current.add(pane);
     if (pendingCmd.current.delete(pane)) {
-      setStatus((st) => ({ ...st, [pane]: { state: "running", since: Date.now() } }));
+      setStatus((st) => ({ ...st, [pane]: { state: "running", since: Date.now(), cwd: sessionCwd(pane) } }));
       return;
     }
     const prev = status[pane];
     if (prev?.state !== "running") return; // the first prompt, or Enter inside a program
+    // an empty Enter changes nothing: the pane keeps showing how its last real command ended
+    if (!command && REPORTS_COMMANDS.includes(session(pane)?.shell ?? shell)) {
+      setStatus(({ [pane]: _, ...st }) => (prev.before ? { ...st, [pane]: prev.before } : st));
+      return;
+    }
     const state = code === null ? "done" : code === 0 ? "ok" : "error";
     setStatus((st) => ({ ...st, [pane]: { state, code, since: Date.now() } }));
     const owner = tabs.find((t) => leaves(t.root).includes(pane));
+    const took = Date.now() - prev.since;
+    if (command)
+      setHistory((h) =>
+        addHistory(h, {
+          cmd: command,
+          cwd: prev.cwd ?? sessionCwd(pane) ?? home,
+          code,
+          at: Date.now(),
+          ms: took,
+          tab: owner ? label(owner) : "flutuante",
+          shell: session(pane)?.shell ?? shell,
+        }),
+      );
     if (!owner) return;
     const away = owner.id !== active || !document.hasFocus();
     if (owner.id !== active) setActivity((a) => ({ ...a, [owner.id]: "finished" }));
-    const took = Date.now() - prev.since;
     if (away && took >= NOTIFY_AFTER_MS)
-      notify(state === "error" ? `Comando falhou (código ${code})` : "Comando terminou", `${label(owner)} · ${duration(took)}`).catch(() => {});
+      notify(
+        state === "error" ? `Comando falhou (código ${code})` : "Comando terminou",
+        `${command ? `${command} · ` : ""}${label(owner)} · ${duration(took)}`,
+      ).catch(() => {});
+  }
+
+  function setHistory(f: (h: HistoryEntry[]) => HistoryEntry[]) {
+    setHistoryState((h) => {
+      const next = f(h);
+      saveHistory(next);
+      return next;
+    });
+  }
+
+  /** Same command in every chosen pane, as if typed there (status and history follow) */
+  function runIn(cmd: string, panes: number[]) {
+    // straight to each pane, not through onInput: a synced tab would get it once per pane
+    for (const p of panes) writePane(p, cmd + "\r");
+    markRunning(panes);
+    setBatch(false);
+    toast(`Enviado para ${panes.length} ${panes.length === 1 ? "painel" : "painéis"}`, { description: cmd });
+  }
+
+  /** Tree view: go to the tab, and to the pane when one was picked */
+  function goTo(tabId: number, pane?: number) {
+    setTree(false);
+    setActive(tabId);
+    if (pane !== undefined) updateTabById(tabId, (t) => ({ ...t, focus: pane, zoom: false }));
+    const target = pane ?? tabs.find((t) => t.id === tabId)?.focus;
+    if (target !== undefined) setTimeout(() => focusSession(target), 0);
+  }
+
+  function updateTabById(id: number, f: (t: Tab) => Tab) {
+    setTabs((ts) => ts.map((t) => (t.id === id ? f(t) : t)));
   }
 
   // Looking at a tab clears its activity mark
@@ -819,6 +896,20 @@ export default function App() {
   }
 
   const label = (t: Tab) => t.name || titles[t.focus]?.split(/[\\/]/).pop() || SHELLS[shell];
+
+  const tabInfos = (): TabInfo[] =>
+    tabs.map((t, i) => ({
+      id: t.id,
+      label: `${i + 1}: ${label(t)}`,
+      panes: leaves(t.root).map((p) => ({
+        id: p,
+        cwd: sessionCwd(p) ?? starts.current.get(p)?.cwd ?? home,
+        shell: SHELLS[session(p)?.shell ?? starts.current.get(p)?.shell ?? shell],
+        state: status[p]?.state,
+        code: status[p]?.code,
+        ended: exited[p] !== undefined,
+      })),
+    }));
 
   // Empty name = back to the automatic one (the shell title)
   function rename(t: Tab, name: string) {
@@ -915,6 +1006,23 @@ export default function App() {
     { id: "quit", group: "App", title: "Sair (fecha todos os terminais)", icon: LogOut, keywords: "fechar quit", run: quitAll },
     { id: "update", group: "App", title: "Procurar atualizações", icon: Download, keywords: "versão update", run: () => checkForUpdate(false, () => saveLayout.current()) },
     { id: "settings", group: "App", title: "Configurações", icon: Gear, keywords: "preferências prefixo", run: () => setSettings(true) },
+    { id: "tree", group: "Abas", title: "Abas e painéis (com prévia)", icon: ListTree, keywords: "árvore choose-tree navegar", shortcut: P("w"), run: () => setTree(true) },
+    { id: "batch", group: "Terminal", title: "Executar em vários painéis", icon: Play, keywords: "lote todos confirmar", shortcut: P("e"), run: () => setBatch(true) },
+    ...latestRuns(history)
+      .slice(0, 50)
+      .map((h, i) => ({
+        id: `history-${i}`,
+        group: "Histórico de comandos",
+        title: h.cmd.replace(/\s+/g, " ").slice(0, 80),
+        icon: History,
+        keywords: `${h.cwd} ${h.tab}`,
+        shortcut: `${h.code === null ? "" : h.code === 0 ? "ok" : `✗ ${h.code}`} · ${duration(h.ms)}`.replace(/^ · /, ""),
+        // typed in the focused pane, like the user did it (status, sync and history follow)
+        run: () => tab && onInput(tab.focus, h.cmd + "\r"),
+      })),
+    ...(history.length
+      ? [{ id: "history-clear", group: "Histórico de comandos", title: "Limpar o histórico de comandos", icon: X, run: () => setHistory(() => []) }]
+      : []),
     { id: "help", group: "App", title: "Atalhos de teclado", icon: Keyboard, keywords: "ajuda help", shortcut: P("?"), run: () => setHelp(true) },
   ];
 
@@ -1062,6 +1170,7 @@ export default function App() {
 
         <main className="relative min-h-0 flex-1 p-1">
           {tab && (tab.zoom ? render({ kind: "leaf", id: tab.focus }) : render(tab.root))}
+          {tree && <TreeView tabs={tabInfos()} current={tab?.focus} onPick={goTo} onClose={() => backToTerminal(false, setTree)} />}
           {popup?.visible && (
             <div className="absolute inset-0 z-30 grid bg-background/60 p-[5%] backdrop-blur-sm">
               <div className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-primary/50 bg-background shadow-[0_0_40px_-8px_var(--glow)]">
@@ -1155,6 +1264,13 @@ export default function App() {
             ))}
           </select>
         </footer>
+        <BatchRun
+          open={batch}
+          onOpenChange={(o) => backToTerminal(o, setBatch)}
+          tabs={batch ? tabInfos() : []}
+          initial={tab ? leaves(tab.root) : []}
+          onRun={runIn}
+        />
         <Palette open={palette} onOpenChange={(o) => backToTerminal(o, setPalette)} commands={commands} initialQuery={paletteQuery} />
         <Settings
           open={settings}

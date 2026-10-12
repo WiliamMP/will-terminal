@@ -25,6 +25,9 @@
 - Gravar a saída de um painel em `.log` (texto puro): `Ctrl+B P` liga e desliga; os arquivos ficam em `%LOCALAPPDATA%\com.wiliammp.will-terminal\logs`
 - Terminal flutuante por cima do layout: `Ctrl+B t` mostra e esconde, `exit` fecha
 - Linha de comando: `will-terminal --perfil dev`, `--projeto will-repo`, `--cmd "npm test" --pasta .` (com o app aberto, a aba abre nele). O instalador coloca o app no PATH do usuário
+- Histórico de comandos com pasta, código e duração: `Ctrl+B h` lista os últimos na paleta, Enter roda de novo no painel atual (PowerShell, Git Bash e WSL)
+- Abas e painéis com prévia das últimas linhas, como o choose-tree do tmux: `Ctrl+B w`
+- Executar um comando em vários painéis com prévia e confirmação: `Ctrl+B e`
 - Paleta de comandos: `Ctrl+Shift+P` ou `Ctrl+B :`
 - Busca no terminal, rolagem inclusa: `Ctrl+Shift+F`
 - Modo cópia: `Ctrl+B [`, rolar com setas/`j`/`k`/PgUp/PgDn, `Enter` copia a seleção, `q` sai
