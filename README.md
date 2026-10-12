@@ -57,7 +57,7 @@ Crie uma tag de versão e envie: `git tag v0.2.0 && git push origin v0.2.0`. O w
 Segredos do repositório no GitHub (Settings → Secrets → Actions):
 
 - `TAURI_SIGNING_PRIVATE_KEY`: conteúdo de `~/.tauri/will-terminal.key`
-- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: vazio (a chave foi gerada sem senha)
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: não precisa (a chave foi gerada sem senha)
 
 Lembre de subir a versão em `package.json`, `src-tauri/Cargo.toml` e `src-tauri/tauri.conf.json`.
 
