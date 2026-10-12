@@ -29,23 +29,36 @@ struct Output {
     data: String,
 }
 
+// Each shell's prompt also prints OSC 9;9 with the current folder (same sequence
+// Windows Terminal uses), so a new pane can open where the focused one is.
+// PowerShell: wraps the prompt from the user's profile, which already ran.
+const PS_CWD: &str = r#"$__will_prompt = $function:prompt; function prompt { "$([char]27)]9;9;$($executionContext.SessionState.Path.CurrentLocation.ProviderPath)$([char]7)" + (& $__will_prompt) }"#;
+
+fn powershell(exe: &str) -> CommandBuilder {
+    let mut c = CommandBuilder::new(exe);
+    c.args(["-NoLogo", "-NoExit", "-Command", PS_CWD]);
+    c
+}
+
 /// Program for the terminal setting; Windows Terminal itself can't be embedded, so it uses PowerShell
 fn shell(kind: &str) -> CommandBuilder {
     match kind {
-        "cmd" => CommandBuilder::new("cmd.exe"),
-        "pwsh" => CommandBuilder::new("pwsh.exe"),
+        "cmd" => {
+            let mut c = CommandBuilder::new("cmd.exe");
+            c.env("PROMPT", r"$e]9;9;$P$e\$P$G");
+            c
+        }
+        "pwsh" => powershell("pwsh.exe"),
         "git-bash" => {
             let base = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
             let mut c = CommandBuilder::new(format!(r"{base}\Git\bin\bash.exe"));
             c.arg("--login");
             c.arg("-i");
+            // ponytail: a ~/.bashrc that sets its own PROMPT_COMMAND wins and the folder is not reported
+            c.env("PROMPT_COMMAND", r#"printf '\e]9;9;%s\e\\' "$(cygpath -w "$PWD")""#);
             c
         }
-        _ => {
-            let mut c = CommandBuilder::new("powershell.exe");
-            c.arg("-NoLogo");
-            c
-        }
+        _ => powershell("powershell.exe"),
     }
 }
 
@@ -84,7 +97,12 @@ pub fn pty_spawn(
         })
         .map_err(|e| e.to_string())?;
     let mut cmd = shell(&shell_kind);
-    cmd.cwd(&cwd);
+    // a folder that is gone (or a PowerShell drive like HKLM:) opens in the user folder instead of failing
+    if std::path::Path::new(&cwd).is_dir() {
+        cmd.cwd(&cwd);
+    } else if let Ok(home) = std::env::var("USERPROFILE") {
+        cmd.cwd(home);
+    }
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -166,6 +184,48 @@ mod tests {
         pending.extend_from_slice(&bytes[2..]);
         assert_eq!(take_utf8(&mut pending), "ção");
         assert!(pending.is_empty());
+    }
+
+    /// Real shell in a pty until `want` shows up in its output (or 15s)
+    fn read_until(mut cmd: CommandBuilder, want: &str) -> String {
+        let pair = native_pty_system()
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        cmd.cwd(std::env::temp_dir());
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+        writer.write_all(b"\x1b[1;1R").unwrap(); // ConPTY's cursor-position question, see below
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 || tx.send(String::from_utf8_lossy(&buf[..n]).into_owned()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut all = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !all.contains(want) && std::time::Instant::now() < deadline {
+            if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                all.push_str(&chunk);
+            }
+        }
+        let _ = child.kill();
+        all
+    }
+
+    /// The prompts report their folder through ConPTY, for "new pane in the same folder"
+    #[test]
+    fn prompts_report_the_folder() {
+        let dir = std::env::temp_dir();
+        let want = format!("\x1b]9;9;{}", dir.to_string_lossy().trim_end_matches('\\'));
+        for kind in ["powershell", "cmd"] {
+            let out = read_until(shell(kind), &want);
+            assert!(out.contains(&want), "{kind}: {out:?}");
+        }
     }
 
     /// Real shell in a pty: runs a command and reads its output

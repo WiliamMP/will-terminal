@@ -18,6 +18,7 @@ fn close_splash(app: tauri::AppHandle) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .manage(pty::Terminals::default())
         .invoke_handler(tauri::generate_handler![
             close_splash,

@@ -10,10 +10,10 @@ import { Toaster, toast } from "sonner";
 import { IconButton } from "./components/ui";
 import { dragWindow, WindowControls } from "./components/WindowControls";
 import { leaves, neighbor, newId, remove, split, type Dir, type Pane } from "./panes";
-import { getSession, handlers, killSession, SHELLS, type ShellKind } from "./session";
+import { focusSession, getSession, handlers, killSession, sessionCwd, SHELLS, zoomFont, type ShellKind } from "./session";
 
-// A tab is a tmux "window": a tree of panes, the one with the cursor, and whether it is zoomed
-type Tab = { id: number; root: Pane; focus: number; zoom: boolean };
+// A tab is a tmux "window": a tree of panes, the one with the cursor, whether it is zoomed, and a name given by the user
+type Tab = { id: number; root: Pane; focus: number; zoom: boolean; name?: string };
 
 const SHELL_KEY = "will-terminal.shell";
 const ARROWS: Record<string, Dir> = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
@@ -29,9 +29,12 @@ const BINDINGS: [string, string][] = [
   ["n / p", "Próxima / anterior aba"],
   ["1-9", "Ir para a aba"],
   ["&", "Fechar aba"],
+  [",", "Renomear aba"],
   ["Ctrl+B", "Enviar Ctrl+B ao shell"],
   ["?", "Esta ajuda"],
 ];
+
+const FONT_KEYS: Record<string, number> = { "=": 1, "+": 1, "-": -1, "0": 0 };
 
 function newTab(): Tab {
   const pane = newId();
@@ -76,6 +79,9 @@ export default function App() {
   const [prefix, setPrefix] = useState(false);
   const [help, setHelp] = useState(false);
   const [titles, setTitles] = useState<Record<number, string>>({});
+  const [editing, setEditing] = useState<number | null>(null);
+  // Folder each new pane starts in: the focused pane's folder at the moment it was created
+  const startDir = useRef(new Map<number, string>());
   const [home, setHome] = useState("");
   const [shell, setShell] = useState<ShellKind>(() => {
     const saved = localStorage.getItem(SHELL_KEY);
@@ -100,20 +106,29 @@ export default function App() {
     setTabs((ts) => ts.map((t) => (t.id === active ? f(t) : t)));
   }
 
+  // New panes and tabs open in the focused pane's folder, when its prompt reported one
+  function inheritDir(pane: number) {
+    const cwd = tab && sessionCwd(tab.focus);
+    if (cwd) startDir.current.set(pane, cwd);
+  }
+
   function addTab() {
     const t = newTab();
+    inheritDir(t.focus);
     setTabs((ts) => [...ts, t]);
     setActive(t.id);
   }
 
   function splitPane(dir: "row" | "col") {
     const id = newId();
+    inheritDir(id);
     updateTab((t) => ({ ...t, root: split(t.root, t.focus, dir, id), focus: id, zoom: false }));
   }
 
   // Closing the last pane closes the tab; closing the last tab closes the app, like leaving tmux
   function closePane(pane: number) {
     killSession(pane);
+    startDir.current.delete(pane);
     const owner = tabs.find((t) => leaves(t.root).includes(pane));
     if (!owner) return;
     const root = remove(owner.root, pane);
@@ -135,7 +150,10 @@ export default function App() {
   function closeTab(t: Tab) {
     // remove the tree first, so the shells' own exit events find nothing to close
     const left = tabs.filter((x) => x.id !== t.id);
-    leaves(t.root).forEach(killSession);
+    leaves(t.root).forEach((p) => {
+      killSession(p);
+      startDir.current.delete(p);
+    });
     if (left.length === 0) {
       getCurrentWindow().close();
       return;
@@ -158,6 +176,10 @@ export default function App() {
   function onKey(pane: number, e: KeyboardEvent): boolean {
     if (help && e.key === "Escape") {
       setHelp(false);
+      return false;
+    }
+    if (e.ctrlKey && !e.altKey && e.key in FONT_KEYS) {
+      zoomFont(FONT_KEYS[e.key]);
       return false;
     }
     if (!prefix) {
@@ -184,6 +206,7 @@ export default function App() {
     else if (e.key === "p") setActive(tabs[(index - 1 + tabs.length) % tabs.length].id);
     else if (/^[1-9]$/.test(e.key) && tabs[+e.key - 1]) setActive(tabs[+e.key - 1].id);
     else if (e.key === "?") setHelp(true);
+    else if (e.key === ",") setEditing(tab.id);
     return false;
   }
 
@@ -200,12 +223,19 @@ export default function App() {
     toast(`Novos painéis vão abrir no ${SHELLS[s]}`);
   }
 
-  const label = (t: Tab) => titles[t.focus]?.split(/[\\/]/).pop() || SHELLS[shell];
+  const label = (t: Tab) => t.name || titles[t.focus]?.split(/[\\/]/).pop() || SHELLS[shell];
+
+  // Empty name = back to the automatic one (the shell title)
+  function rename(t: Tab, name: string) {
+    setTabs((ts) => ts.map((x) => (x.id === t.id ? { ...x, name: name.trim() || undefined } : x)));
+    setEditing(null);
+    focusSession(t.focus);
+  }
 
   function render(p: Pane): React.ReactNode {
     if (p.kind === "leaf")
       return (
-        <Leaf id={p.id} focused={p.id === tab?.focus} cwd={home} shell={shell} onFocus={() => updateTab((t) => ({ ...t, focus: p.id }))} />
+        <Leaf id={p.id} focused={p.id === tab?.focus} cwd={startDir.current.get(p.id) ?? home} shell={shell} onFocus={() => updateTab((t) => ({ ...t, focus: p.id }))} />
       );
     return (
       <Group key={p.id} orientation={p.dir === "row" ? "horizontal" : "vertical"} className="h-full">
@@ -233,16 +263,37 @@ export default function App() {
             <SquareTerminal size={18} />
           </div>
           {tabs.map((t, i) => (
-            <button
+            <div
+              role="tab"
+              aria-selected={t.id === active}
               key={t.id}
               onClick={() => setActive(t.id)}
+              onDoubleClick={() => setEditing(t.id)}
               className={cn(
-                "group flex h-8 max-w-48 items-center gap-2 rounded-t-md px-3 text-xs text-muted-foreground transition-colors hover:text-foreground",
+                "group flex h-8 max-w-48 cursor-pointer items-center gap-2 rounded-t-md px-3 text-xs text-muted-foreground transition-colors hover:text-foreground",
                 t.id === active && "bg-background text-foreground shadow-[inset_0_2px_0_var(--primary)]",
               )}
             >
               <span className="font-mono text-primary">{i + 1}</span>
-              <span className="truncate">{label(t)}</span>
+              {editing === t.id ? (
+                <input
+                  autoFocus
+                  defaultValue={t.name ?? label(t)}
+                  aria-label="Nome da aba"
+                  onFocus={(e) => e.currentTarget.select()}
+                  onBlur={(e) => rename(t, e.currentTarget.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") e.currentTarget.blur();
+                    else if (e.key === "Escape") {
+                      setEditing(null);
+                      focusSession(t.focus);
+                    }
+                  }}
+                  className="w-28 rounded border border-ring bg-transparent px-1 outline-none"
+                />
+              ) : (
+                <span className="truncate">{label(t)}</span>
+              )}
               {t.zoom && <Maximize2 size={11} className="shrink-0 text-primary" />}
               <X
                 size={13}
@@ -253,7 +304,7 @@ export default function App() {
                   closeTab(t);
                 }}
               />
-            </button>
+            </div>
           ))}
           <IconButton label="Nova aba (Ctrl+B c)" onClick={addTab} className="mb-0.5 size-7">
             <Plus size={16} />

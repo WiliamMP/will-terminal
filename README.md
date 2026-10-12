@@ -11,7 +11,11 @@
 - Abas e painéis divididos, redimensionáveis com o mouse
 - Teclas do tmux: prefixo `Ctrl+B`, depois `%` `"` `c` `x` `z` `n` `p` `o`, setas e `1-9` (`Ctrl+B ?` mostra todas)
 - PowerShell, PowerShell 7, cmd ou Git Bash (escolha na barra de status)
-- `Ctrl+C` com texto selecionado copia
+- Painel e aba novos abrem na pasta do painel atual
+- Renomear aba: duplo clique ou `Ctrl+B ,`
+- `Ctrl+C` com texto selecionado copia, `Ctrl+V` cola; botão direito copia a seleção ou cola
+- `Ctrl+clique` em links abre no navegador
+- `Ctrl +`, `Ctrl -` e `Ctrl 0` mudam o tamanho da fonte
 - Tema claro e escuro, seguindo o sistema
 
 ## Como rodar
