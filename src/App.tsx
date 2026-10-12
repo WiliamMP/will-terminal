@@ -1084,12 +1084,13 @@ export default function App() {
           {searching && tab && <SearchBar key={tab.focus} pane={tab.focus} onClose={() => setSearching(false)} />}
           {help && (
             <div className="absolute inset-0 z-10 grid place-items-center bg-background/70 backdrop-blur-sm" onMouseDown={() => setHelp(false)}>
-              <div className="w-96 rounded-lg border bg-card p-4 shadow-[0_0_40px_var(--glow)]">
+              <div className="max-h-[94%] w-[min(760px,94%)] overflow-y-auto rounded-lg border bg-card p-4 shadow-[0_0_40px_var(--glow)]">
                 <h2 className="mb-3 flex items-center gap-2 font-medium">
                   <Keyboard size={16} className="text-primary" /> Atalhos (depois de {prefixLabel})
                 </h2>
                 {[BINDINGS, GLOBAL_BINDINGS].map((list, i) => (
-                  <dl key={i} className={cn("grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5", i > 0 && "mt-3 border-t pt-3")}>
+                  // two key/description pairs per row, so the whole list fits in the window
+                  <dl key={i} className={cn("grid grid-cols-[auto_1fr_auto_1fr] gap-x-4 gap-y-1.5", i > 0 && "mt-3 border-t pt-3")}>
                     {list.map(([k, d]) => (
                       <div key={k} className="contents">
                         <dt>

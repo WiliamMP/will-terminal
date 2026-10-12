@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -17,8 +17,9 @@ type Res<T> = Result<T, String>;
 struct Session {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    // which spawn this is: restarting a pane reuses its id, and the old reader thread must not report the new shell's exit
+    // the child itself is owned by its waiter thread; this only ends it
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    // which spawn this is: restarting a pane reuses its id, and the old waiter must not report the new shell's exit
     token: u64,
     // pipe-pane: while Some, everything the shell prints also goes to this file, as plain text
     log: Arc<Mutex<Option<File>>>,
@@ -178,7 +179,7 @@ pub fn pty_spawn(
     } else if let Ok(home) = std::env::var("USERPROFILE") {
         cmd.cwd(home);
     }
-    let child = pair
+    let mut child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| format!("Não foi possível abrir o terminal: {e}"))?;
@@ -194,15 +195,35 @@ pub fn pty_spawn(
         Session {
             writer,
             master: pair.master,
-            child,
+            killer: child.clone_killer(),
             token,
             log: log.clone(),
         },
     ) {
-        let _ = old.child.kill();
+        let _ = old.killer.kill();
     }
 
-    // reader thread: shell output -> "pty-output" events (and the log file), then "pty-exit" with the exit code
+    // Waiter thread: the end of the shell is the end of the child process, not of the output. ConPTY keeps
+    // the output open (its conhost stays alive) while we hold the pty, so the reader alone never sees the end.
+    let waiter_app = app.clone();
+    std::thread::spawn(move || {
+        let code = child.wait().map(|st| st.exit_code()).unwrap_or(u32::MAX);
+        // only a shell that ended on its own is reported: a killed or replaced one is no longer in the map.
+        // Removing it drops the pty, which closes ConPTY and ends the reader thread too.
+        let ended = {
+            let state = waiter_app.state::<Terminals>();
+            let mut sessions = state.sessions.lock().unwrap();
+            match sessions.get(&id) {
+                Some(s) if s.token == token => sessions.remove(&id),
+                _ => None,
+            }
+        };
+        if ended.is_some() {
+            let _ = waiter_app.emit("pty-exit", Exit { id, code });
+        }
+    });
+
+    // reader thread: shell output -> "pty-output" events (and the log file)
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         let mut pending = Vec::new();
@@ -218,19 +239,6 @@ pub fn pty_spawn(
                 }
                 let _ = app.emit("pty-output", Output { id, data });
             }
-        }
-        // only a shell that ended on its own is reported: a killed or replaced one is no longer in the map
-        let ended = {
-            let state = app.state::<Terminals>();
-            let mut sessions = state.sessions.lock().unwrap();
-            match sessions.get(&id) {
-                Some(s) if s.token == token => sessions.remove(&id),
-                _ => None,
-            }
-        };
-        if let Some(mut s) = ended {
-            let code = s.child.wait().map(|st| st.exit_code()).unwrap_or(u32::MAX);
-            let _ = app.emit("pty-exit", Exit { id, code });
         }
     });
     Ok(())
@@ -288,7 +296,7 @@ pub fn pty_resize(state: State<Terminals>, id: u32, cols: u16, rows: u16) -> Res
 #[tauri::command]
 pub fn pty_kill(state: State<Terminals>, id: u32) -> Res<()> {
     if let Some(mut s) = state.sessions.lock().unwrap().remove(&id) {
-        let _ = s.child.kill();
+        let _ = s.killer.kill();
     }
     Ok(())
 }

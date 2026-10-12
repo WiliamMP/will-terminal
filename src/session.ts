@@ -22,6 +22,8 @@ export type Session = {
   cwd: string;
   shell: ShellKind;
   started: boolean;
+  /** start command waiting for the first prompt */
+  pendingCommand?: string;
   /** how it started, to start it again the same way (restart) */
   start: Start;
   /** file the output is being copied to (pipe-pane), if any */
@@ -80,8 +82,15 @@ function theme() {
     magenta: css("--primary"),
     cyan: css("--lane-2"),
     white: css("--foreground"),
+    // bright variants too: xterm's defaults are pastel and vanish on the light background
     brightBlack: css("--muted-foreground"),
+    brightRed: css("--destructive"),
+    brightGreen: css("--success"),
+    brightYellow: css("--warning"),
+    brightBlue: css("--lane-2"),
     brightMagenta: css("--accent-foreground"),
+    brightCyan: css("--lane-2"),
+    brightWhite: css("--foreground"),
   };
 }
 
@@ -123,6 +132,7 @@ export function getSession(id: number, start: Start): Session {
   // OSC 133;D[;code]: the prompt says the previous command ended (see pty.rs)
   term.parser.registerOscHandler(133, (data) => {
     if (!data.startsWith("D")) return false;
+    sendPendingCommand(id);
     const code = Number.parseInt(data.split(";")[1]);
     handlers.done(id, Number.isNaN(code) ? null : code);
     return true;
@@ -154,7 +164,8 @@ export function getSession(id: number, start: Start): Session {
 
   spawn(id, s);
   // xterm's own answers (cursor position, device attributes, focus) belong to this pane only, never to synced ones
-  term.onData((data) => (isReply(data) ? writePane(id, data) : handlers.input(id, data)));
+  // A reply can be needed before pty_spawn returns (the Rust side registers the pty before its first output), so it skips the `started` check
+  term.onData((data) => (isReply(data) ? invoke("pty_write", { id, data }).catch(() => {}) : handlers.input(id, data)));
   term.onResize(({ cols, rows }) => s.started && invoke("pty_resize", { id, cols, rows }));
   return s;
 }
@@ -167,14 +178,25 @@ function spawn(id: number, s: Session) {
     .then(
       () => {
         s.started = true;
-        // the shell queues it until its prompt is ready, like keys typed while it loads
-        if (command) writePane(id, command + "\r");
+        // Typed at the first prompt (OSC 133;D). Sent right away, it reached ConPTY while it was still waiting for
+        // the terminal's first answer and the pane froze. A shell that never reports a prompt gets it after 5s.
+        if (command) {
+          s.pendingCommand = command;
+          setTimeout(() => sendPendingCommand(id), 5000);
+        }
       },
       (err) => {
         toast.error(String(err));
         handlers.exit(id, null);
       },
     );
+}
+
+function sendPendingCommand(id: number) {
+  const s = sessions.get(id);
+  if (!s?.pendingCommand) return;
+  writePane(id, s.pendingCommand + "\r");
+  s.pendingCommand = undefined;
 }
 
 /** tmux respawn-pane: a fresh shell in the same pane, in the folder it was in, running its start command again.

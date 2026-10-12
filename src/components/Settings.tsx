@@ -131,10 +131,11 @@ export function Settings(p: Props) {
             <Dialog.Title className="flex items-center gap-2 font-medium">
               <Gear size={16} className="text-primary" /> Configurações
             </Dialog.Title>
+            {/* plain button, not IconButton: the dialog focuses it on open, and a tooltip would pop up by itself */}
             <Dialog.Close asChild>
-              <IconButton label="Fechar" className="size-7">
+              <Button size="icon" aria-label="Fechar" title="Fechar" className="size-7">
                 <X size={15} />
-              </IconButton>
+              </Button>
             </Dialog.Close>
           </div>
           <Dialog.Description className="sr-only">Prefixo, tema, shell, perfis e atualizações</Dialog.Description>
