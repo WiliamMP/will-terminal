@@ -37,6 +37,22 @@ fn list_dirs(root: String) -> Result<Vec<String>, String> {
     Ok(dirs)
 }
 
+/// Command line: `will-terminal --perfil dev`, `--projeto x`, `--cmd "npm test" --pasta .`
+#[derive(Clone, serde::Serialize)]
+struct Cli {
+    args: Vec<String>,
+    cwd: String,
+}
+
+/// The arguments this instance started with; later launches arrive as "cli" events instead
+#[tauri::command]
+fn startup_args() -> Cli {
+    Cli {
+        args: std::env::args().collect(),
+        cwd: std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default(),
+    }
+}
+
 /// Reattach: the window was only hidden, so its terminals are exactly as they were
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -50,7 +66,11 @@ fn show_main(app: &AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         // first plugin: opening the app again while it runs in the tray shows that one instead of a second copy
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
+        // and passes along its command line (relative --pasta resolves from where it was typed)
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            show_main(app);
+            let _ = app.emit("cli", Cli { args, cwd });
+        }))
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -86,10 +106,13 @@ pub fn run() {
             close_splash,
             exit_app,
             list_dirs,
+            startup_args,
             pty::pty_spawn,
             pty::pty_write,
             pty::pty_resize,
             pty::pty_kill,
+            pty::pty_log_start,
+            pty::pty_log_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

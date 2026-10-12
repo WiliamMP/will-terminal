@@ -22,17 +22,22 @@ export type Session = {
   cwd: string;
   shell: ShellKind;
   started: boolean;
+  /** how it started, to start it again the same way (restart) */
+  start: Start;
+  /** file the output is being copied to (pipe-pane), if any */
+  logPath?: string;
 };
 
 // App sets these; a session calls them for keys (return false = consumed), typed input, output,
-// the end of a command (its exit code, null when the shell can't tell), title changes and exit
+// the end of a command (its exit code, null when the shell can't tell), title changes and the end of
+// the shell itself (exit code; null = it never started)
 export const handlers = {
   key: (_id: number, _e: KeyboardEvent) => true,
   input: (id: number, data: string) => writePane(id, data),
   output: (_id: number) => {},
   done: (_id: number, _code: number | null) => {},
   title: (_id: number, _title: string) => {},
-  exit: (_id: number) => {},
+  exit: (_id: number, _code: number | null) => {},
 };
 
 export const SHELLS = { powershell: "PowerShell", pwsh: "PowerShell 7", cmd: "cmd", "git-bash": "Git Bash", wsl: "WSL" };
@@ -49,7 +54,13 @@ const output = listen<{ id: number; data: string }>("pty-output", (e) => {
   s.term.write(e.payload.data);
   handlers.output(e.payload.id);
 });
-const exited = listen<number>("pty-exit", (e) => sessions.has(e.payload) && handlers.exit(e.payload));
+const exited = listen<{ id: number; code: number }>("pty-exit", ({ payload: { id, code } }) => {
+  const s = sessions.get(id);
+  if (!s) return;
+  s.started = false;
+  s.logPath = undefined; // the file closed with the shell
+  handlers.exit(id, code);
+});
 
 const css = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
@@ -83,7 +94,8 @@ export function applyTheme() {
 /** How a pane starts. `command`: typed into the shell once it starts (profiles), as if the user did it. */
 export type Start = { cwd: string; shell: ShellKind; command?: string; env?: [string, string][] };
 
-export function getSession(id: number, { cwd, shell, command, env }: Start): Session {
+export function getSession(id: number, start: Start): Session {
+  const { cwd, shell } = start;
   const existing = sessions.get(id);
   if (existing) return existing;
 
@@ -103,7 +115,7 @@ export function getSession(id: number, { cwd, shell, command, env }: Start): Ses
   // Ctrl+click opens in the browser, so a plain click can still select text
   term.loadAddon(new WebLinksAddon((e, url) => e.ctrlKey && openUrl(url)));
   term.open(el);
-  const s: Session = { term, fit, search, el, cwd, shell, started: false };
+  const s: Session = { term, fit, search, el, cwd, shell, started: false, start };
   term.parser.registerOscHandler(9, (data) => {
     if (data.startsWith("9;")) s.cwd = data.slice(2);
     return data.startsWith("9;");
@@ -140,9 +152,18 @@ export function getSession(id: number, { cwd, shell, command, env }: Start): Ses
   });
   term.onTitleChange((t) => handlers.title(id, t));
 
-  // Listeners must exist before the shell starts: ConPTY's first output is a question xterm must answer
+  spawn(id, s);
+  // xterm's own answers (cursor position, device attributes, focus) belong to this pane only, never to synced ones
+  term.onData((data) => (isReply(data) ? writePane(id, data) : handlers.input(id, data)));
+  term.onResize(({ cols, rows }) => s.started && invoke("pty_resize", { id, cols, rows }));
+  return s;
+}
+
+// Listeners must exist before the shell starts: ConPTY's first output is a question xterm must answer
+function spawn(id: number, s: Session) {
+  const { cwd, shell, command, env } = s.start;
   Promise.all([output, exited])
-    .then(() => invoke("pty_spawn", { id, cwd, shellKind: shell, env, cols: term.cols, rows: term.rows }))
+    .then(() => invoke("pty_spawn", { id, cwd, shellKind: shell, env, cols: s.term.cols, rows: s.term.rows }))
     .then(
       () => {
         s.started = true;
@@ -151,13 +172,40 @@ export function getSession(id: number, { cwd, shell, command, env }: Start): Ses
       },
       (err) => {
         toast.error(String(err));
-        handlers.exit(id);
+        handlers.exit(id, null);
       },
     );
-  // xterm's own answers (cursor position, device attributes, focus) belong to this pane only, never to synced ones
-  term.onData((data) => (isReply(data) ? writePane(id, data) : handlers.input(id, data)));
-  term.onResize(({ cols, rows }) => s.started && invoke("pty_resize", { id, cols, rows }));
-  return s;
+}
+
+/** tmux respawn-pane: a fresh shell in the same pane, in the folder it was in, running its start command again.
+ *  The old output stays above a separator; a live shell is replaced (Rust kills it). */
+export function restartSession(id: number) {
+  const s = sessions.get(id);
+  if (!s) return;
+  s.started = false;
+  s.logPath = undefined;
+  s.start = { ...s.start, cwd: s.cwd };
+  s.term.write("\r\n\x1b[2m──────── reiniciado ────────\x1b[0m\r\n");
+  spawn(id, s);
+}
+
+/** Message under the output of a shell that ended with an error; the pane stays so nothing is lost */
+export function showExited(id: number, code: number, hint: string) {
+  sessions.get(id)?.term.write(`\r\n\x1b[31m[processo encerrado com código ${code}]\x1b[0m \x1b[2m${hint}\x1b[0m\r\n`);
+}
+
+/** pipe-pane: copies what the pane prints from now on to a .log file; returns its path */
+export async function startLog(id: number, name: string) {
+  const s = sessions.get(id);
+  if (!s) throw new Error("Terminal fechado");
+  s.logPath = await invoke<string>("pty_log_start", { id, name });
+  return s.logPath;
+}
+
+export async function stopLog(id: number) {
+  const s = sessions.get(id);
+  if (s) s.logPath = undefined;
+  await invoke("pty_log_stop", { id });
 }
 
 export function writePane(id: number, data: string) {

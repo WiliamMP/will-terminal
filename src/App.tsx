@@ -1,14 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
-import { homeDir, join } from "@tauri-apps/api/path";
+import { homeDir, join, resolve } from "@tauri-apps/api/path";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { cn } from "cn";
 import {
+  AppWindow,
   ArrowLeftRight,
   Check,
+  CircleDot,
+  RotateCcw,
   ChevronDown,
   CircleX,
   ClipboardPaste,
@@ -47,7 +51,7 @@ import { LAYOUTS, PREFIXES, Settings, type CloseAction, type PrefixKey, type The
 import { IconButton } from "./components/ui";
 import { dragWindow, WindowControls } from "./components/WindowControls";
 import { isPane, layoutTree, leaves, neighbor, newId, remove, split, swap, type Dir, type Layout, type Pane } from "./panes";
-import { parseEnv, type Profile } from "./profiles";
+import { parseCli, parseEnv, type Profile } from "./profiles";
 import {
   applyTheme,
   buffers,
@@ -57,9 +61,13 @@ import {
   handlers,
   killSession,
   pasteInto,
+  restartSession,
   session,
   sessionCwd,
   SHELLS,
+  showExited,
+  startLog,
+  stopLog,
   writePane,
   zoomFont,
   type ShellKind,
@@ -107,6 +115,9 @@ const BINDINGS: [string, string][] = [
   ["]", "Colar a última cópia"],
   ["=", "Colar do histórico de cópias"],
   ["f", "Abrir projeto"],
+  ["t", "Terminal flutuante (mostra/esconde)"],
+  ["R", "Reiniciar painel"],
+  ["P", "Gravar a saída do painel em arquivo"],
   ["d", "Desanexar: esconde na bandeja, os terminais continuam"],
   [":", "Paleta de comandos"],
   ["?", "Esta ajuda"],
@@ -149,6 +160,14 @@ const duration = (ms: number) => {
   const sec = Math.round(ms / 1000);
   return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}min ${sec % 60}s`;
 };
+
+/** Local date and time for file names: 2026-10-11 23-40-05 */
+function stamp(d = new Date()) {
+  const n = (x: number) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${n(d.getMonth() + 1)}-${n(d.getDate())} ${n(d.getHours())}-${n(d.getMinutes())}-${n(d.getSeconds())}`;
+}
+
+type Cli = { args: string[]; cwd: string };
 
 async function notify(title: string, body: string) {
   let granted = await isPermissionGranted();
@@ -272,6 +291,12 @@ export default function App() {
   // tabs out of view that printed something, or finished a command, since they were last shown
   const [activity, setActivity] = useState<Record<number, "output" | "finished">>({});
   const [paletteQuery, setPaletteQuery] = useState("");
+  // panes whose shell ended with an error: kept on screen (with the code) until Enter restarts them
+  const [exited, setExited] = useState<Record<number, number>>({});
+  // panes whose output is being copied to a file (pipe-pane), with the file
+  const [logging, setLogging] = useState<Record<number, string>>({});
+  // the floating scratch terminal: one shell kept while hidden, gone when it exits
+  const [popup, setPopup] = useState<{ id: number; visible: boolean } | null>(null);
   const [projectsRoot, setProjectsRoot] = useState(() => localStorage.getItem(PROJECTS_KEY) ?? "");
   const [projects, setProjects] = useState<string[]>([]);
   // first detach: explain where the window went, when it comes back
@@ -308,6 +333,8 @@ export default function App() {
           setActive(t.id);
         }
       })
+      .then(() => invoke<Cli>("startup_args"))
+      .then((c) => cliRef.current(c))
       .finally(() => invoke("close_splash"));
     getVersion().then(setVersion);
     checkForUpdate(true, () => saveLayout.current());
@@ -339,12 +366,18 @@ export default function App() {
   };
   const onQuit = useRef(() => {});
   onQuit.current = () => quitAll();
+  const cliRef = useRef((_c: Cli) => {});
+  cliRef.current = (c) => {
+    runCli(c).catch((err) => toast.error(String(err)));
+  };
   useEffect(() => {
     const win = getCurrentWindow();
     const offs = [
       win.onCloseRequested((e) => onClose.current(e)),
       // "Sair" in the tray menu: save, then end
       listen("quit-requested", () => onQuit.current()),
+      // will-terminal --perfil dev, typed while the app runs: the running one opens it
+      listen<Cli>("cli", (e) => cliRef.current(e.payload)),
       win.onFocusChanged(({ payload }) => {
         if (!payload || !detachNotice.current) return;
         detachNotice.current = false;
@@ -431,6 +464,89 @@ export default function App() {
     setActive(t.id);
   }
 
+  /** Command line: open a profile, a project, or a tab in a folder running a command */
+  async function runCli({ args, cwd }: Cli) {
+    const req = parseCli(args);
+    if (req.profile) {
+      const pr = profiles.find((x) => x.name.toLowerCase() === req.profile!.toLowerCase());
+      if (pr) openProfile(pr);
+      else toast.error(`Perfil não encontrado: ${req.profile}`);
+    }
+    if (req.project) {
+      if (projectsRoot.trim()) await openProject(req.project);
+      else toast.error("Escolha a pasta de projetos nas Configurações");
+    }
+    if (req.cmd || req.dir) {
+      const t = newTab();
+      starts.current.set(t.focus, { cwd: req.dir ? await resolve(cwd, req.dir) : cwd || undefined, command: req.cmd });
+      if (req.cmd) pendingCmd.current.add(t.focus);
+      setTabs((ts) => [...ts, t]);
+      setActive(t.id);
+    }
+  }
+
+  /** A shell that ended: a clean exit (typed `exit`) closes its pane like tmux; an error keeps the pane and its
+   *  output, with the code, until Enter restarts it */
+  function onExit(pane: number, code: number | null) {
+    if (pane === popup?.id) return closePopup();
+    if (code === null || code === 0) return closePane(pane);
+    integrated.current.delete(pane);
+    setExited((x) => ({ ...x, [pane]: code }));
+    setLogging(({ [pane]: _, ...rest }) => rest);
+    setStatus((st) => ({ ...st, [pane]: { state: "error", code, since: Date.now() } }));
+    showExited(pane, code, `Enter reinicia · ${P("x")} fecha`);
+  }
+
+  /** tmux respawn-pane: same pane, same folder, its start command again; the old output stays above */
+  function restartPane(pane: number) {
+    setExited(({ [pane]: _, ...rest }) => rest);
+    setStatus(({ [pane]: _, ...rest }) => rest);
+    setLogging(({ [pane]: _, ...rest }) => rest);
+    integrated.current.delete(pane);
+    if (session(pane)?.start.command) pendingCmd.current.add(pane);
+    restartSession(pane);
+    focusSession(pane);
+  }
+
+  /** tmux pipe-pane: copies what the pane prints, as plain text, to a .log file in the app's log folder */
+  async function toggleLog(pane: number) {
+    try {
+      if (logging[pane]) {
+        await stopLog(pane);
+        toast("Gravação parada", { description: logging[pane] });
+        setLogging(({ [pane]: _, ...rest }) => rest);
+        return;
+      }
+      const owner = tabs.find((t) => leaves(t.root).includes(pane));
+      const path = await startLog(pane, `${owner ? label(owner) : "painel"} ${stamp()}`);
+      setLogging((l) => ({ ...l, [pane]: path }));
+      toast.success("Gravando a saída do painel", { description: path, action: { label: "Abrir pasta", onClick: () => revealItemInDir(path) } });
+    } catch (err) {
+      toast.error(String(err));
+    }
+  }
+
+  /** Scratch terminal over the layout, in the focused pane's folder; hiding keeps it, `exit` ends it */
+  function togglePopup() {
+    if (!popup) {
+      const id = newId();
+      const cwd = tab && sessionCwd(tab.focus);
+      starts.current.set(id, cwd ? { cwd } : {});
+      setPopup({ id, visible: true });
+    } else if (popup.visible) {
+      setPopup({ ...popup, visible: false });
+      if (tab) focusSession(tab.focus);
+    } else setPopup({ ...popup, visible: true });
+  }
+
+  function closePopup() {
+    if (!popup) return;
+    killSession(popup.id);
+    forget(popup.id);
+    setPopup(null);
+    if (tab) focusSession(tab.focus);
+  }
+
   function openPalette(query = "") {
     setPaletteQuery(query);
     setPalette(true);
@@ -466,6 +582,8 @@ export default function App() {
     starts.current.delete(pane);
     integrated.current.delete(pane);
     pendingCmd.current.delete(pane);
+    setExited(({ [pane]: _, ...rest }) => rest);
+    setLogging(({ [pane]: _, ...rest }) => rest);
     setStatus(({ [pane]: _, ...rest }) => rest);
   }
 
@@ -564,6 +682,11 @@ export default function App() {
       if (r === "search") setSearching(true);
       return false;
     }
+    // an ended shell: Enter restarts it, other keys have nowhere to go
+    if (!prefix && !isPrefix && exited[pane] !== undefined) {
+      if (e.key === "Enter") restartPane(pane);
+      return false;
+    }
     if (!prefix) {
       if (!isPrefix) return true;
       setPrefix(true);
@@ -571,6 +694,8 @@ export default function App() {
     }
     setPrefix(false);
     if (!tab) return false;
+    // the floating terminal only knows how to hide (and to pass the prefix on)
+    if (pane === popup?.id && !isPrefix && e.key !== "t") return false;
     // prefix twice sends the prefix itself (Ctrl+B = \x02, Ctrl+A = \x01, Ctrl+Space = \0)
     if (isPrefix) writePane(pane, prefixKey === " " ? "\0" : String.fromCharCode(prefixKey.charCodeAt(0) - 96));
     else if (e.key === "%") splitPane("row");
@@ -591,6 +716,9 @@ export default function App() {
     else if (e.key === "d") detach();
     else if (e.key === ":") openPalette();
     else if (e.key === " ") cycleLayout();
+    else if (e.key === "t") togglePopup();
+    else if (e.key === "R") restartPane(tab.focus);
+    else if (e.key === "P") toggleLog(tab.focus);
     else if (e.key === "=") openPalette("colar");
     else if (e.key === "]") {
       if (buffers[0]) pasteInto(pane, buffers[0]);
@@ -653,7 +781,7 @@ export default function App() {
     handlers.input = onInput;
     handlers.output = onOutput;
     handlers.done = onDone;
-    handlers.exit = closePane;
+    handlers.exit = onExit;
     handlers.title = (id, title) => setTitles((ts) => ({ ...ts, [id]: title }));
   });
 
@@ -717,6 +845,7 @@ export default function App() {
       keywords: "layout",
       run: () => updateTab((t) => ({ ...t, root: layoutTree(leaves(t.root), l), layout: l, zoom: false })),
     })),
+    { id: "restart", group: "Painéis", title: "Reiniciar painel", icon: RotateCcw, keywords: "respawn recarregar", shortcut: P("R"), run: () => tab && restartPane(tab.focus) },
     { id: "close-pane", group: "Painéis", title: "Fechar painel", icon: X, shortcut: P("x"), run: () => tab && closePane(tab.focus) },
     { id: "new-tab", group: "Abas", title: "Nova aba", icon: Plus, shortcut: P("c"), run: addTab },
     { id: "next-tab", group: "Abas", title: "Próxima aba", icon: ArrowLeftRight, shortcut: P("n"), run: () => goTab(1) },
@@ -725,6 +854,24 @@ export default function App() {
     { id: "close-tab", group: "Abas", title: "Fechar aba", icon: X, shortcut: P("&"), run: () => tab && closeTab(tab) },
     ...tabs.map((t, i) => ({ id: `tab-${t.id}`, group: "Abas", title: `Ir para ${i + 1}: ${label(t)}`, icon: SquareTerminal, run: () => setActive(t.id) })),
     { id: "search", group: "Terminal", title: "Buscar no terminal", icon: Search, keywords: "find procurar", shortcut: "Ctrl+Shift+F", run: () => setSearching(true) },
+    {
+      id: "popup",
+      group: "Terminal",
+      title: popup?.visible ? "Esconder o terminal flutuante" : "Terminal flutuante",
+      icon: AppWindow,
+      keywords: "popup scratch",
+      shortcut: P("t"),
+      run: togglePopup,
+    },
+    {
+      id: "log",
+      group: "Terminal",
+      title: tab && logging[tab.focus] ? "Parar de gravar a saída do painel" : "Gravar a saída do painel em arquivo",
+      icon: CircleDot,
+      keywords: "log pipe-pane salvar",
+      shortcut: P("P"),
+      run: () => tab && toggleLog(tab.focus),
+    },
     { id: "copy-mode", group: "Terminal", title: "Modo cópia", icon: Copy, keywords: "rolar scroll selecionar", shortcut: P("["), run: enterCopyMode },
     { id: "font-up", group: "Terminal", title: "Aumentar fonte", icon: Type, keywords: "zoom maior", shortcut: "Ctrl +", run: () => zoomFont(1) },
     { id: "font-down", group: "Terminal", title: "Diminuir fonte", icon: Minus, keywords: "zoom menor", shortcut: "Ctrl -", run: () => zoomFont(-1) },
@@ -915,6 +1062,25 @@ export default function App() {
 
         <main className="relative min-h-0 flex-1 p-1">
           {tab && (tab.zoom ? render({ kind: "leaf", id: tab.focus }) : render(tab.root))}
+          {popup?.visible && (
+            <div className="absolute inset-0 z-30 grid bg-background/60 p-[5%] backdrop-blur-sm">
+              <div className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-primary/50 bg-background shadow-[0_0_40px_-8px_var(--glow)]">
+                <div className="flex h-7 shrink-0 items-center gap-2 border-b bg-sidebar px-3 text-xs text-muted-foreground">
+                  <AppWindow size={13} className="text-primary" /> Terminal flutuante
+                  <span className="ml-auto font-mono text-[11px]">{P("t")} esconde · exit fecha</span>
+                </div>
+                <div className="relative min-h-0 flex-1">
+                  <Leaf
+                    id={popup.id}
+                    focused
+                    synced={false}
+                    start={{ ...starts.current.get(popup.id), cwd: starts.current.get(popup.id)?.cwd ?? home, shell: starts.current.get(popup.id)?.shell ?? shell }}
+                    onFocus={() => {}}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
           {searching && tab && <SearchBar key={tab.focus} pane={tab.focus} onClose={() => setSearching(false)} />}
           {help && (
             <div className="absolute inset-0 z-10 grid place-items-center bg-background/70 backdrop-blur-sm" onMouseDown={() => setHelp(false)}>
@@ -956,6 +1122,15 @@ export default function App() {
             </button>
           )}
           {tab && <PaneState status={status[tab.focus]} />}
+          {tab && logging[tab.focus] && (
+            <button
+              onClick={() => revealItemInDir(logging[tab.focus])}
+              title={`Gravando em ${logging[tab.focus]}`}
+              className="flex items-center gap-1 rounded bg-destructive/15 px-1.5 text-destructive"
+            >
+              <CircleDot size={10} /> REC
+            </button>
+          )}
           {tab && (
             <span>
               [{index + 1}/{tabs.length}] {leaves(tab.root).length} {leaves(tab.root).length === 1 ? "painel" : "painéis"}

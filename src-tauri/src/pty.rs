@@ -3,12 +3,14 @@
 // Each session lives in a map by id, like a list of TProcess objects.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{Read, Write};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 type Res<T> = Result<T, String>;
 
@@ -16,7 +18,13 @@ struct Session {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
+    // which spawn this is: restarting a pane reuses its id, and the old reader thread must not report the new shell's exit
+    token: u64,
+    // pipe-pane: while Some, everything the shell prints also goes to this file, as plain text
+    log: Arc<Mutex<Option<File>>>,
 }
+
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
 pub struct Terminals {
@@ -27,6 +35,51 @@ pub struct Terminals {
 struct Output {
     id: u32,
     data: String,
+}
+
+#[derive(Clone, Serialize)]
+struct Exit {
+    id: u32,
+    code: u32,
+}
+
+/// Text for the log file: escape sequences (colors, cursor moves, OSC) removed, line ends kept
+// ponytail: a sequence cut between two reads leaks a few characters; full-screen programs (vim) log as a jumble
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\x1b' => match it.next() {
+                // CSI: parameters, then one final byte in @..~
+                Some('[') => {
+                    for n in it.by_ref() {
+                        if ('@'..='~').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: until BEL or ESC \
+                Some(']') => {
+                    while let Some(n) = it.next() {
+                        if n == '\x07' {
+                            break;
+                        }
+                        if n == '\x1b' {
+                            it.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {} // two-character sequence
+            },
+            '\n' | '\t' => out.push(c),
+            // \r: ConPTY ends lines with \r\n, a lone one redraws the line
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // Shell integration: every prompt prints two invisible sequences before itself.
@@ -132,17 +185,24 @@ pub fn pty_spawn(
     drop(pair.slave); // the child keeps its own handle; ours would keep the pty open after exit
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let log = Arc::new(Mutex::new(None::<File>));
 
-    state.sessions.lock().unwrap().insert(
+    // a restart replaces the old shell under the same id
+    if let Some(mut old) = state.sessions.lock().unwrap().insert(
         id,
         Session {
             writer,
             master: pair.master,
             child,
+            token,
+            log: log.clone(),
         },
-    );
+    ) {
+        let _ = old.child.kill();
+    }
 
-    // reader thread: shell output -> "pty-output" events, then "pty-exit"
+    // reader thread: shell output -> "pty-output" events (and the log file), then "pty-exit" with the exit code
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         let mut pending = Vec::new();
@@ -153,11 +213,52 @@ pub fn pty_spawn(
             pending.extend_from_slice(&buf[..n]);
             let data = take_utf8(&mut pending);
             if !data.is_empty() {
+                if let Some(f) = log.lock().unwrap().as_mut() {
+                    let _ = f.write_all(strip_ansi(&data).as_bytes());
+                }
                 let _ = app.emit("pty-output", Output { id, data });
             }
         }
-        let _ = app.emit("pty-exit", id);
+        // only a shell that ended on its own is reported: a killed or replaced one is no longer in the map
+        let ended = {
+            let state = app.state::<Terminals>();
+            let mut sessions = state.sessions.lock().unwrap();
+            match sessions.get(&id) {
+                Some(s) if s.token == token => sessions.remove(&id),
+                _ => None,
+            }
+        };
+        if let Some(mut s) = ended {
+            let code = s.child.wait().map(|st| st.exit_code()).unwrap_or(u32::MAX);
+            let _ = app.emit("pty-exit", Exit { id, code });
+        }
     });
+    Ok(())
+}
+
+/// pipe-pane: starts copying the pane's output, as plain text, to `<app log folder>/<name>.log`; returns the path
+#[tauri::command]
+pub fn pty_log_start(app: AppHandle, state: State<Terminals>, id: u32, name: String) -> Res<String> {
+    let dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let safe: String = name.chars().map(|c| if c.is_alphanumeric() || "-_. ".contains(c) { c } else { '_' }).collect();
+    let path = dir.join(format!("{safe}.log"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("Não foi possível criar {}: {e}", path.display()))?;
+    let sessions = state.sessions.lock().unwrap();
+    let s = sessions.get(&id).ok_or("Terminal fechado")?;
+    *s.log.lock().unwrap() = Some(file);
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
+pub fn pty_log_stop(state: State<Terminals>, id: u32) -> Res<()> {
+    if let Some(s) = state.sessions.lock().unwrap().get(&id) {
+        *s.log.lock().unwrap() = None;
+    }
     Ok(())
 }
 
@@ -195,6 +296,27 @@ pub fn pty_kill(state: State<Terminals>, id: u32) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_ansi_keeps_only_the_text() {
+        let raw = "\x1b[32mok\x1b[0m done\r\n\x1b]9;9;C:\\x\x07\x1b]133;D;0\x1b\\PS> \x1b[?25h";
+        assert_eq!(strip_ansi(raw), "ok done\nPS> ");
+    }
+
+    /// The exit code reaches us through ConPTY (shown when a pane's shell ends with an error)
+    #[test]
+    fn exit_code_comes_through() {
+        let pair = native_pty_system()
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.args(["/C", "exit 3"]);
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let mut writer = pair.master.take_writer().unwrap();
+        writer.write_all(b"\x1b[1;1R").unwrap();
+        assert_eq!(child.wait().unwrap().exit_code(), 3);
+    }
 
     #[test]
     fn utf8_split_across_reads() {

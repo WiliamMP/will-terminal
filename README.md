@@ -21,6 +21,10 @@
 - Alternar o arranjo dos painéis: `Ctrl+B Espaço` (lado a lado, empilhados, um grande + pilha)
 - Projetos: escolha uma pasta de projetos e `Ctrl+B f` lista as subpastas para abrir uma aba nelas
 - Histórico de cópias: `Ctrl+B =` lista as últimas 10, `Ctrl+B ]` cola a mais recente (só na memória)
+- Shell que termina com erro não some: o painel fica com a saída e o código, `Enter` reinicia. `Ctrl+B R` reinicia qualquer painel (mesma pasta, mesmo comando inicial)
+- Gravar a saída de um painel em `.log` (texto puro): `Ctrl+B P` liga e desliga; os arquivos ficam em `%LOCALAPPDATA%\com.wiliammp.will-terminal\logs`
+- Terminal flutuante por cima do layout: `Ctrl+B t` mostra e esconde, `exit` fecha
+- Linha de comando: `will-terminal --perfil dev`, `--projeto will-repo`, `--cmd "npm test" --pasta .` (com o app aberto, a aba abre nele)
 - Paleta de comandos: `Ctrl+Shift+P` ou `Ctrl+B :`
 - Busca no terminal, rolagem inclusa: `Ctrl+Shift+F`
 - Modo cópia: `Ctrl+B [`, rolar com setas/`j`/`k`/PgUp/PgDn, `Enter` copia a seleção, `q` sai
