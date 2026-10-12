@@ -1,10 +1,17 @@
 import { useEffect, useRef, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "cn";
 import {
   ArrowLeftRight,
+  ChevronDown,
+  Download,
+  EyeOff,
+  LayoutTemplate,
+  LogOut,
   Columns2,
   Command as CommandIcon,
   Copy,
@@ -23,16 +30,16 @@ import {
   Type,
   X,
 } from "lucide-react";
-import { Tooltip } from "radix-ui";
+import { DropdownMenu, Tooltip } from "radix-ui";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { Toaster, toast } from "sonner";
 import type { Command } from "./commands";
 import { Palette } from "./components/Palette";
 import { SearchBar } from "./components/SearchBar";
-import { PREFIXES, Settings, type PrefixKey, type Theme } from "./components/Settings";
+import { PREFIXES, Settings, type CloseAction, type PrefixKey, type Profile, type Theme } from "./components/Settings";
 import { IconButton } from "./components/ui";
 import { dragWindow, WindowControls } from "./components/WindowControls";
-import { isPane, leaves, neighbor, newId, remove, split, swap, type Dir, type Pane } from "./panes";
+import { isPane, layoutTree, leaves, neighbor, newId, remove, split, swap, type Dir, type Pane } from "./panes";
 import {
   applyTheme,
   copySelection,
@@ -47,6 +54,7 @@ import {
   zoomFont,
   type ShellKind,
 } from "./session";
+import { checkForUpdate } from "./updater";
 
 // A tab is a tmux "window": a tree of panes, the one with the cursor, whether it is zoomed,
 // whether typing goes to all its panes (synchronize-panes), and a name given by the user
@@ -56,6 +64,9 @@ const SHELL_KEY = "will-terminal.shell";
 const PREFIX_KEY = "will-terminal.prefix";
 const THEME_KEY = "will-terminal.theme"; // also read by index.html, before React loads
 const LAYOUT_KEY = "will-terminal.layout";
+const CLOSE_KEY = "will-terminal.closeAction";
+const PROFILES_KEY = "will-terminal.profiles";
+const DETACHED_KEY = "will-terminal.detachedOnce";
 const ARROWS: Record<string, Dir> = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
 const FONT_KEYS: Record<string, number> = { "=": 1, "+": 1, "-": -1, "0": 0 };
 
@@ -73,6 +84,7 @@ const BINDINGS: [string, string][] = [
   [",", "Renomear aba"],
   ["&", "Fechar aba"],
   ["[", "Modo cópia (q sai)"],
+  ["d", "Desanexar: esconde na bandeja, os terminais continuam"],
   [":", "Paleta de comandos"],
   ["?", "Esta ajuda"],
 ];
@@ -92,7 +104,7 @@ function newTab(): Tab {
   return { id: newId(), root: { kind: "leaf", id: pane }, focus: pane, zoom: false, sync: false };
 }
 
-type Saved = { tabs: Tab[]; active: number; cwds: Record<number, string> };
+type Saved = { tabs: Tab[]; active: number; cwds: Record<number, string>; shells?: Record<number, ShellKind> };
 
 /** Layout of the last session, or null if there is none (or it is damaged) */
 function loadLayout(): Saved | null {
@@ -102,6 +114,15 @@ function loadLayout(): Saved | null {
     if (v && Array.isArray(v.tabs) && v.tabs.length > 0 && v.tabs.every(ok)) return v;
   } catch {}
   return null;
+}
+
+function loadProfiles(): Profile[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(PROFILES_KEY) ?? "[]");
+    return Array.isArray(v) ? v.filter((x) => typeof x?.id === "string" && Array.isArray(x.commands) && x.shell in SHELLS) : [];
+  } catch {
+    return [];
+  }
 }
 
 /** Copy mode (prefix + [): the keys scroll the pane instead of going to the shell, like tmux */
@@ -125,12 +146,12 @@ function copyModeKey(pane: number, e: KeyboardEvent): "stay" | "exit" | "search"
 }
 
 /** One shell: borrows the session's element, so moving the pane in the tree keeps the shell alive */
-function Leaf(props: { id: number; focused: boolean; synced: boolean; cwd: string; shell: ShellKind; onFocus: () => void }) {
-  const { id, focused, synced, cwd, shell, onFocus } = props;
+function Leaf(props: { id: number; focused: boolean; synced: boolean; cwd: string; shell: ShellKind; command?: string; onFocus: () => void }) {
+  const { id, focused, synced, cwd, shell, command, onFocus } = props;
   const slot = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const s = getSession(id, cwd, shell);
+    const s = getSession(id, cwd, shell, command);
     slot.current!.appendChild(s.el);
     const observer = new ResizeObserver(() => s.fit.fit());
     observer.observe(slot.current!);
@@ -171,6 +192,14 @@ export default function App() {
   const [editing, setEditing] = useState<number | null>(null);
   // Folder each new pane starts in: the focused pane's folder when it was created, or the saved one on restore
   const startDir = useRef(new Map<number, string>());
+  // Same idea for profiles and restored layouts: the shell of each pane and the command it starts with
+  const startShell = useRef(new Map<number, ShellKind>());
+  const startCmd = useRef(new Map<number, string>());
+  // first detach: explain where the window went, when it comes back
+  const detachNotice = useRef(false);
+  const [version, setVersion] = useState("");
+  const [profiles, setProfilesState] = useState<Profile[]>(loadProfiles);
+  const [closeAction, setCloseAction] = useState<CloseAction>(() => read(CLOSE_KEY, ["background", "quit"], "background"));
   const [home, setHome] = useState("");
   const [shell, setShell] = useState<ShellKind>(() => read(SHELL_KEY, Object.keys(SHELLS) as ShellKind[], "powershell"));
   const [prefixKey, setPrefixKey] = useState<PrefixKey>(() => read(PREFIX_KEY, ["b", "a", " "], "b"));
@@ -187,6 +216,7 @@ export default function App() {
         const saved = loadLayout();
         if (saved) {
           for (const [id, cwd] of Object.entries(saved.cwds ?? {})) startDir.current.set(+id, cwd);
+          for (const [id, sh] of Object.entries(saved.shells ?? {})) if (sh in SHELLS) startShell.current.set(+id, sh);
           const restored = saved.tabs.map((t) => ({ ...t, zoom: false, sync: false }));
           setTabs(restored);
           setActive(restored.some((t) => t.id === saved.active) ? saved.active : restored[0].id);
@@ -197,20 +227,48 @@ export default function App() {
         }
       })
       .finally(() => invoke("close_splash"));
+    getVersion().then(setVersion);
+    checkForUpdate(true, () => saveLayout.current());
   }, []);
 
   // Closing the window keeps the layout (tabs, panes, folders) for the next start; the shells themselves end
   const saveLayout = useRef(() => {});
   saveLayout.current = () => {
     const cwds: Record<number, string> = {};
-    for (const t of tabs) for (const p of leaves(t.root)) cwds[p] = sessionCwd(p) ?? startDir.current.get(p) ?? home;
-    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ tabs, active, cwds } satisfies Saved));
+    const shells: Record<number, ShellKind> = {};
+    for (const t of tabs)
+      for (const p of leaves(t.root)) {
+        cwds[p] = sessionCwd(p) ?? startDir.current.get(p) ?? home;
+        shells[p] = session(p)?.shell ?? startShell.current.get(p) ?? shell;
+      }
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ tabs, active, cwds, shells } satisfies Saved));
   };
+  // The window's X either detaches (hide, shells keep running) or quits, per Settings; read through a ref, so one listener is enough
+  const onClose = useRef((_e: { preventDefault: () => void }) => {});
+  onClose.current = (e) => {
+    if (closeAction === "background") {
+      e.preventDefault();
+      detach();
+    } else saveLayout.current();
+  };
+  const onQuit = useRef(() => {});
+  onQuit.current = () => quitAll();
   useEffect(() => {
-    const off = getCurrentWindow().onCloseRequested(() => saveLayout.current());
-    return () => {
-      off.then((f) => f());
-    };
+    const win = getCurrentWindow();
+    const offs = [
+      win.onCloseRequested((e) => onClose.current(e)),
+      // "Sair" in the tray menu: save, then end
+      listen("quit-requested", () => onQuit.current()),
+      win.onFocusChanged(({ payload }) => {
+        if (!payload || !detachNotice.current) return;
+        detachNotice.current = false;
+        toast("Os terminais continuaram rodando em segundo plano", {
+          description: "Fechar a janela só esconde o app na bandeja. Para sair de verdade: bandeja → Sair, ou Sair na paleta.",
+          duration: 10000,
+        });
+      }),
+    ];
+    return () => offs.forEach((off) => off.then((f) => f()));
   }, []);
 
   // Theme: the .dark class drives the Neon tokens; the terminals repaint from them
@@ -228,7 +286,44 @@ export default function App() {
   // Leaving tmux: the last pane closed ends the app and the next start is a fresh one
   function quit() {
     localStorage.removeItem(LAYOUT_KEY);
-    getCurrentWindow().destroy();
+    invoke("exit_app");
+  }
+
+  /** Ends the app with every shell, keeping the layout for the next start */
+  function quitAll() {
+    saveLayout.current();
+    invoke("exit_app");
+  }
+
+  /** tmux detach: the window hides in the tray and the shells keep running; opening the app again shows it */
+  function detach() {
+    if (!localStorage.getItem(DETACHED_KEY)) {
+      localStorage.setItem(DETACHED_KEY, "1");
+      detachNotice.current = true;
+    }
+    getCurrentWindow().hide();
+  }
+
+  function setProfiles(f: (ps: Profile[]) => Profile[]) {
+    setProfilesState((ps) => {
+      const next = f(ps);
+      localStorage.setItem(PROFILES_KEY, JSON.stringify(next));
+      return next;
+    });
+  }
+
+  /** A new tab laid out by the profile, each pane in its folder and shell, running its command */
+  function openProfile(pr: Profile) {
+    const commands = pr.commands.length ? pr.commands : [""];
+    const ids = commands.map(() => newId());
+    ids.forEach((id, i) => {
+      if (pr.cwd.trim()) startDir.current.set(id, pr.cwd.trim());
+      startShell.current.set(id, pr.shell);
+      if (commands[i].trim()) startCmd.current.set(id, commands[i].trim());
+    });
+    const t: Tab = { id: newId(), root: layoutTree(ids, pr.layout), focus: ids[0], zoom: false, sync: false, name: pr.name || undefined };
+    setTabs((ts) => [...ts, t]);
+    setActive(t.id);
   }
 
   function updateTab(f: (t: Tab) => Tab) {
@@ -254,10 +349,16 @@ export default function App() {
     updateTab((t) => ({ ...t, root: split(t.root, t.focus, dir, id), focus: id, zoom: false }));
   }
 
+  function forget(pane: number) {
+    startDir.current.delete(pane);
+    startShell.current.delete(pane);
+    startCmd.current.delete(pane);
+  }
+
   // Closing the last pane closes the tab; closing the last tab closes the app
   function closePane(pane: number) {
     killSession(pane);
-    startDir.current.delete(pane);
+    forget(pane);
     const owner = tabs.find((t) => leaves(t.root).includes(pane));
     if (!owner) return;
     const root = remove(owner.root, pane);
@@ -278,7 +379,7 @@ export default function App() {
     const left = tabs.filter((x) => x.id !== t.id);
     leaves(t.root).forEach((p) => {
       killSession(p);
-      startDir.current.delete(p);
+      forget(p);
     });
     if (left.length === 0) return quit();
     setTabs(left);
@@ -373,6 +474,7 @@ export default function App() {
     else if (/^[1-9]$/.test(e.key) && tabs[+e.key - 1]) setActive(tabs[+e.key - 1].id);
     else if (e.key === ",") setEditing(tab.id);
     else if (e.key === "[") enterCopyMode();
+    else if (e.key === "d") detach();
     else if (e.key === ":") setPalette(true);
     else if (e.key === "?") setHelp(true);
     return false;
@@ -411,6 +513,10 @@ export default function App() {
   function changePrefix(p: PrefixKey) {
     setPrefixKey(p);
     localStorage.setItem(PREFIX_KEY, p);
+  }
+  function changeCloseAction(c: CloseAction) {
+    setCloseAction(c);
+    localStorage.setItem(CLOSE_KEY, c);
   }
   function changeTheme(t: Theme) {
     setTheme(t);
@@ -457,6 +563,18 @@ export default function App() {
     { id: "theme-dark", group: "Aparência", title: "Tema escuro", icon: Moon, run: () => changeTheme("dark") },
     { id: "theme-light", group: "Aparência", title: "Tema claro", icon: Sun, run: () => changeTheme("light") },
     { id: "theme-system", group: "Aparência", title: "Tema do sistema", icon: Sun, run: () => changeTheme("system") },
+    ...profiles.map((pr) => ({
+      id: `profile-${pr.id}`,
+      group: "Perfis",
+      title: `Abrir perfil: ${pr.name || "Sem nome"}`,
+      icon: LayoutTemplate,
+      keywords: pr.commands.join(" "),
+      run: () => openProfile(pr),
+    })),
+    { id: "profiles", group: "Perfis", title: "Gerenciar perfis", icon: LayoutTemplate, keywords: "criar editar", run: () => setSettings(true) },
+    { id: "detach", group: "App", title: "Desanexar (esconder na bandeja)", icon: EyeOff, keywords: "detach segundo plano", shortcut: P("d"), run: detach },
+    { id: "quit", group: "App", title: "Sair (fecha todos os terminais)", icon: LogOut, keywords: "fechar quit", run: quitAll },
+    { id: "update", group: "App", title: "Procurar atualizações", icon: Download, keywords: "versão update", run: () => checkForUpdate(false, () => saveLayout.current()) },
     { id: "settings", group: "App", title: "Configurações", icon: Gear, keywords: "preferências prefixo", run: () => setSettings(true) },
     { id: "help", group: "App", title: "Atalhos de teclado", icon: Keyboard, keywords: "ajuda help", shortcut: P("?"), run: () => setHelp(true) },
   ];
@@ -469,19 +587,20 @@ export default function App() {
           focused={p.id === tab?.focus}
           synced={!!tab?.sync}
           cwd={startDir.current.get(p.id) ?? home}
-          shell={shell}
+          shell={startShell.current.get(p.id) ?? shell}
+          command={startCmd.current.get(p.id)}
           onFocus={() => updateTab((t) => ({ ...t, focus: p.id }))}
         />
       );
     return (
       <Group key={p.id} orientation={p.dir === "row" ? "horizontal" : "vertical"} className="h-full">
-        <Panel id={`${p.a.id}`} minSize={60}>
+        <Panel id={`${p.a.id}`} minSize={60} defaultSize={`${p.size ?? 50}`}>
           {render(p.a)}
         </Panel>
         <Separator
           className={cn("bg-border transition-colors outline-none hover:bg-primary focus-visible:bg-primary", p.dir === "row" ? "w-px" : "h-px")}
         />
-        <Panel id={`${p.b.id}`} minSize={60}>
+        <Panel id={`${p.b.id}`} minSize={60} defaultSize={`${100 - (p.size ?? 50)}`}>
           {render(p.b)}
         </Panel>
       </Group>
@@ -549,6 +668,41 @@ export default function App() {
           <IconButton label={`Nova aba (${P("c")})`} onClick={addTab} className="mb-0.5 size-7">
             <Plus size={16} />
           </IconButton>
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger asChild>
+              <button
+                aria-label="Abrir perfil"
+                title="Abrir perfil"
+                className="mb-0.5 -ml-1 grid h-7 w-4 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+              >
+                <ChevronDown size={13} />
+              </button>
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content
+                align="start"
+                sideOffset={4}
+                className="z-50 min-w-52 rounded-md border bg-popover p-1 text-popover-foreground shadow-[0_0_30px_-8px_var(--glow)] animate-in fade-in-0 zoom-in-95"
+              >
+                {profiles.map((pr) => (
+                  <DropdownMenu.Item
+                    key={pr.id}
+                    onSelect={() => openProfile(pr)}
+                    className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 outline-none data-highlighted:bg-accent data-highlighted:text-accent-foreground"
+                  >
+                    <LayoutTemplate size={14} className="text-primary" /> {pr.name || "Sem nome"}
+                  </DropdownMenu.Item>
+                ))}
+                {profiles.length > 0 && <DropdownMenu.Separator className="my-1 h-px bg-border" />}
+                <DropdownMenu.Item
+                  onSelect={() => setSettings(true)}
+                  className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-muted-foreground outline-none data-highlighted:bg-accent data-highlighted:text-accent-foreground"
+                >
+                  <Gear size={14} /> {profiles.length ? "Gerenciar perfis" : "Criar um perfil"}
+                </DropdownMenu.Item>
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
           <div onMouseDown={dragWindow} className="min-w-6 flex-1 self-stretch" />
           <div className="flex items-center gap-0.5 self-center">
             <IconButton label={`Dividir lado a lado (${P("%")})`} onClick={() => splitPane("row")} className="size-7">
@@ -643,6 +797,13 @@ export default function App() {
           onTheme={changeTheme}
           shell={shell}
           onShell={changeShell}
+          closeAction={closeAction}
+          onCloseAction={changeCloseAction}
+          profiles={profiles}
+          onProfiles={setProfiles}
+          currentCwd={(tab && sessionCwd(tab.focus)) || home}
+          version={version}
+          onCheckUpdate={() => checkForUpdate(false, () => saveLayout.current())}
         />
         <Toaster richColors />
       </div>

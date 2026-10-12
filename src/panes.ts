@@ -2,9 +2,10 @@
 // shell (its id is the pty id) and each split holds two children side by side
 // ("row") or stacked ("col"). Pure functions, so the tree is easy to test.
 
+// size: percent of the split taken by `a` when it first shows (50 if missing); dragging changes it from there
 export type Pane =
   | { kind: "leaf"; id: number }
-  | { kind: "split"; id: number; dir: "row" | "col"; a: Pane; b: Pane };
+  | { kind: "split"; id: number; dir: "row" | "col"; a: Pane; b: Pane; size?: number };
 
 export type Dir = "left" | "right" | "up" | "down";
 
@@ -62,7 +63,20 @@ export function isPane(v: unknown): v is Pane {
   const p = v as Pane;
   if (typeof p?.id !== "number") return false;
   if (p.kind === "leaf") return true;
-  return p.kind === "split" && (p.dir === "row" || p.dir === "col") && isPane(p.a) && isPane(p.b);
+  const sizeOk = p.kind === "split" && (p.size === undefined || (typeof p.size === "number" && p.size > 0 && p.size < 100));
+  return p.kind === "split" && sizeOk && (p.dir === "row" || p.dir === "col") && isPane(p.a) && isPane(p.b);
+}
+
+export type Layout = "row" | "col" | "main";
+
+/** n panes of the same size side by side ("row"), stacked ("col"), or one big on the left and the rest stacked ("main") */
+export function layoutTree(ids: number[], layout: Layout): Pane {
+  const even = (rest: number[], dir: "row" | "col"): Pane =>
+    rest.length === 1
+      ? { kind: "leaf", id: rest[0] }
+      : { kind: "split", id: newId(), dir, a: { kind: "leaf", id: rest[0] }, b: even(rest.slice(1), dir), size: 100 / rest.length };
+  if (layout !== "main" || ids.length < 2) return even(ids, layout === "main" ? "row" : layout);
+  return { kind: "split", id: newId(), dir: "row", a: { kind: "leaf", id: ids[0] }, b: even(ids.slice(1), "col") };
 }
 
 /** Terminal replies to the shell's questions (cursor position, device attributes, focus), as opposed to keys

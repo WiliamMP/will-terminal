@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { isPane, isReply, leaves, neighbor, remove, split, swap, type Pane } from "./panes";
+import { isPane, isReply, layoutTree, leaves, neighbor, remove, split, swap, type Pane } from "./panes";
 
 const leaf = (id: number): Pane => ({ kind: "leaf", id });
 
@@ -45,4 +45,18 @@ test("isReply tells terminal answers from typed keys", () => {
   expect(isReply("\x1b[I")).toBe(true); // focus in
   expect(isReply("\x1b[A")).toBe(false); // arrow up
   expect(isReply("ls\r")).toBe(false);
+});
+
+test("layoutTree gives every pane the same share", () => {
+  // three side by side: the first split gives a 1/3, the inner one splits the other 2/3 in half
+  const row = layoutTree([1, 2, 3], "row");
+  expect(leaves(row)).toEqual([1, 2, 3]);
+  expect(row.kind === "split" && row.size).toBeCloseTo(100 / 3);
+  expect(row.kind === "split" && row.b.kind === "split" && row.b.size).toBe(50);
+  expect(isPane(row)).toBe(true);
+
+  const main = layoutTree([1, 2, 3], "main");
+  expect(main.kind === "split" && main.dir === "row" && main.size).toBe(undefined); // 50/50
+  expect(main.kind === "split" && main.b.kind === "split" && main.b.dir).toBe("col");
+  expect(layoutTree([7], "main")).toEqual({ kind: "leaf", id: 7 });
 });

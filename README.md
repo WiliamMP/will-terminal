@@ -21,7 +21,10 @@
 - Modo cópia: `Ctrl+B [`, rolar com setas/`j`/`k`/PgUp/PgDn, `Enter` copia a seleção, `q` sai
 - Digitar em todos os painéis da aba ao mesmo tempo (pela paleta)
 - Trocar painéis de lugar: `Ctrl+B {` e `}`
-- Reabre com as mesmas abas, painéis e pastas
+- Reabre com as mesmas abas, painéis, pastas e shells
+- Fechar a janela só esconde o app na bandeja: os terminais continuam rodando e abrir o app de novo volta para eles (`Ctrl+B d` faz o mesmo, como o detach do tmux). Para sair: bandeja → Sair
+- Perfis: uma aba pronta com pasta, shell, arranjo dos painéis e um comando por painel (seta ao lado do `+`)
+- Atualização automática pelas releases do GitHub
 - Configurações: prefixo (`Ctrl+B`, `Ctrl+A` ou `Ctrl+Espaço`), tema e shell
 - Tema claro e escuro, seguindo o sistema ou escolhido
 
@@ -33,6 +36,17 @@ npm run tauri dev
 ```
 
 Instalador: `npm run tauri build` (fica em `src-tauri/target/release/bundle/`).
+
+## Release
+
+Crie uma tag de versão e envie: `git tag v0.2.0 && git push origin v0.2.0`. O workflow `release.yml` gera o instalador, assina para o atualizador e publica a release.
+
+Segredos do repositório no GitHub (Settings → Secrets → Actions):
+
+- `TAURI_SIGNING_PRIVATE_KEY`: conteúdo de `~/.tauri/will-terminal.key`
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: vazio (a chave foi gerada sem senha)
+
+Lembre de subir a versão em `package.json`, `src-tauri/Cargo.toml` e `src-tauri/tauri.conf.json`.
 
 ## Licença
 

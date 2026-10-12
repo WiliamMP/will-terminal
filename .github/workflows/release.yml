@@ -1,0 +1,46 @@
+# Builds the Windows installers and publishes them as a GitHub Release when a
+# version tag is pushed (git tag v0.2.0 && git push origin v0.2.0).
+# The installers are signed for the auto-updater; latest.json tells the app
+# which version is the newest and where to download it.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # private key + password created with `tauri signer generate`, saved as repo secrets
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: will-terminal ${{ github.ref_name }}
+          releaseBody: Instale pelo arquivo -setup.exe. Quem já tem o will-terminal recebe esta versão pelo aviso de atualização.
+          releaseDraft: false
+          prerelease: false
+          # the updater installs the NSIS setup (.exe), not the MSI
+          updaterJsonPreferNsis: true

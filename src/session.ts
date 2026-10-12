@@ -14,7 +14,15 @@ import { isReply } from "./panes";
 // shell, every split would kill it. The component only borrows `el`.
 
 // cwd: last folder the shell's prompt reported (OSC 9;9, see pty.rs)
-export type Session = { term: Terminal; fit: FitAddon; search: SearchAddon; el: HTMLDivElement; cwd: string; started: boolean };
+export type Session = {
+  term: Terminal;
+  fit: FitAddon;
+  search: SearchAddon;
+  el: HTMLDivElement;
+  cwd: string;
+  shell: ShellKind;
+  started: boolean;
+};
 
 // App sets these; a session calls them for keys (return false = consumed), typed input, title changes and exit
 export const handlers = {
@@ -64,7 +72,8 @@ export function applyTheme() {
   for (const s of sessions.values()) s.term.options.theme = t;
 }
 
-export function getSession(id: number, cwd: string, shell: ShellKind): Session {
+/** `command`: typed into the shell once it starts (profiles), as if the user did it */
+export function getSession(id: number, cwd: string, shell: ShellKind, command?: string): Session {
   const existing = sessions.get(id);
   if (existing) return existing;
 
@@ -84,7 +93,7 @@ export function getSession(id: number, cwd: string, shell: ShellKind): Session {
   // Ctrl+click opens in the browser, so a plain click can still select text
   term.loadAddon(new WebLinksAddon((e, url) => e.ctrlKey && openUrl(url)));
   term.open(el);
-  const s: Session = { term, fit, search, el, cwd, started: false };
+  const s: Session = { term, fit, search, el, cwd, shell, started: false };
   term.parser.registerOscHandler(9, (data) => {
     if (data.startsWith("9;")) s.cwd = data.slice(2);
     return data.startsWith("9;");
@@ -118,7 +127,11 @@ export function getSession(id: number, cwd: string, shell: ShellKind): Session {
   Promise.all([output, exited])
     .then(() => invoke("pty_spawn", { id, cwd, shellKind: shell, cols: term.cols, rows: term.rows }))
     .then(
-      () => (s.started = true),
+      () => {
+        s.started = true;
+        // the shell queues it until its prompt is ready, like keys typed while it loads
+        if (command) writePane(id, command + "\r");
+      },
       (err) => {
         toast.error(String(err));
         handlers.exit(id);

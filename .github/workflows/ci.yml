@@ -1,0 +1,43 @@
+# Checks every push and pull request: TypeScript + frontend build, then the Rust tests.
+# Windows runner, because the app (and the tests with a real ConPTY shell) target Windows.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# a newer push cancels the run still going for the same branch
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck and build (tsc + vite)
+        run: npm run build
+
+      - name: Frontend tests (Vitest)
+        run: npm test
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test
